@@ -70,7 +70,8 @@ st.success("Industry received")
 @st.cache_data(show_spinner=False)
 def retrieve_wikipedia_docs(query: str, top_k_results: int, language: str):
     retriever = WikipediaRetriever(top_k_results=top_k_results, lang=language)
-    docs = retriever.get_relevant_documents(query)
+    # Newer LangChain retrievers use .invoke()
+    docs = retriever.invoke(query)
     return docs
 
 def extract_url(doc) -> str:
