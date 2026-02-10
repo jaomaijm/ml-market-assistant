@@ -1,6 +1,5 @@
 import re
 import streamlit as st
-
 from langchain_community.retrievers import WikipediaRetriever
 from langchain_openai import ChatOpenAI
 
@@ -9,33 +8,49 @@ from langchain_openai import ChatOpenAI
 # -----------------------------
 st.set_page_config(page_title="Market Research Assistant", page_icon="🔎", layout="wide")
 st.title("🔎 Market Research Assistant")
-st.caption("Tell me an industry → I’ll pull the 5 most relevant Wikipedia pages → then write a <500-word report based on those pages only")
+st.caption("Tell me an industry → I’ll pull 5 relevant Wikipedia pages → then write a <500-word report based on those pages only")
 
 # -----------------------------
-# Sidebar: API key only + link
+# Session state defaults
+# -----------------------------
+for k, v in {
+    "did_search": False,
+    "industry": "",
+    "clarification": "",
+    "docs": None,
+    "query_used": "",
+    "report": "",
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# -----------------------------
+# Sidebar: API key + link + reset
 # -----------------------------
 st.sidebar.header("API Key")
 api_key = st.sidebar.text_input("OpenAI API key", type="password", placeholder="sk-...")
-st.sidebar.caption("Your key is used only for this session and is not stored")
+st.sidebar.caption("Used only for this session and not stored")
 
-st.sidebar.markdown(
-    "Need a key? Get it here: "
-    "[OpenAI API Keys](https://platform.openai.com/api-keys)"
-)
+st.sidebar.markdown("[Get an API key here](https://platform.openai.com/api-keys)")
+
+if st.sidebar.button("🔄 Reset", use_container_width=True):
+    for k in ["did_search", "industry", "clarification", "docs", "query_used", "report"]:
+        st.session_state[k] = "" if isinstance(st.session_state[k], str) else False if isinstance(st.session_state[k], bool) else None
+    st.rerun()
 
 if not api_key:
     st.info("Paste your OpenAI API key in the left sidebar to start")
     st.stop()
 
-# Fixed settings (per your request)
-TOP_K = 5
-LANG = "en"
-MODEL_NAME = "gpt-4.1-mini"  # cheap + good enough for this assignment
-
+# Use a cheap model for build/runtime (aligns with assignment hint)
+MODEL_NAME = "gpt-4.1-mini"
 llm = ChatOpenAI(model=MODEL_NAME, openai_api_key=api_key, temperature=0.2)
 
+TOP_K = 5
+LANG = "en"
+
 # -----------------------------
-# Helpers
+# Helper functions
 # -----------------------------
 def looks_like_input(text: str) -> bool:
     t = (text or "").strip()
@@ -45,6 +60,9 @@ def looks_like_input(text: str) -> bool:
         return False
     return True
 
+def word_count(text: str) -> int:
+    return len(re.findall(r"\b\w+\b", text or ""))
+
 def extract_url(doc) -> str:
     md = getattr(doc, "metadata", {}) or {}
     return md.get("source") or md.get("url") or ""
@@ -53,15 +71,11 @@ def extract_title(doc) -> str:
     md = getattr(doc, "metadata", {}) or {}
     return md.get("title") or md.get("page_title") or "Wikipedia page"
 
-def word_count(text: str) -> int:
-    return len(re.findall(r"\b\w+\b", text or ""))
-
 def retrieve_wikipedia_docs(query: str, top_k: int = TOP_K, lang: str = LANG):
     retriever = WikipediaRetriever(top_k_results=top_k, lang=lang)
     return retriever.invoke(query)
 
 def get_docs_with_fallbacks(industry_text: str):
-    # Try a few safe query variants before asking the user for more context
     candidates = [
         industry_text,
         f"{industry_text} industry",
@@ -74,122 +88,137 @@ def get_docs_with_fallbacks(industry_text: str):
             return docs, q
     return [], industry_text
 
-def enforce_under_500_words(report: str) -> str:
-    if word_count(report) <= 500:
-        return report
-    compress_prompt = (
-        "Shorten the report to UNDER 500 words.\n"
-        "Keep headings and key points.\n\n"
-        f"{report}"
-    )
-    return llm.invoke(compress_prompt).content.strip()
+def should_ask_for_more_context(docs) -> bool:
+    if not docs or len(docs) < 3:
+        return True
+    joined = "\n\n".join([getattr(d, "page_content", "") for d in docs if getattr(d, "page_content", "")])
+    return len(joined.strip()) < 1200
 
 def build_clarifying_questions(industry_term: str) -> str:
     return "\n".join(
         [
-            "I couldn’t confidently identify the right Wikipedia pages for that industry yet",
-            "Can you clarify a bit so I don’t guess",
+            "I couldn’t confidently find the right Wikipedia pages for that yet, so I don’t want to guess",
+            "Can you clarify quickly",
             "",
             f"- When you say “{industry_term}”, what type or sub-segment do you mean",
             "- Any geography focus (global, UK, Thailand, etc)",
             "- Is this mainly B2B, B2C, or both",
-            "- Any specific examples of companies/products in this industry",
+            "- Any example companies/products in this industry",
         ]
     )
 
-def should_ask_for_more_context(docs) -> bool:
-    # If we didn’t get enough pages/content, don’t force a report
-    if not docs or len(docs) < 3:
-        return True
-    joined = "\n\n".join([d.page_content for d in docs if getattr(d, "page_content", "")])
-    # conservative: if context is tiny, it’s risky
-    return len(joined.strip()) < 1200
+def enforce_under_500_words(text: str) -> str:
+    if word_count(text) <= 500:
+        return text
+    compress_prompt = (
+        "Shorten the report to UNDER 500 words.\n"
+        "Keep headings and key points.\n\n"
+        f"{text}"
+    )
+    return llm.invoke(compress_prompt).content.strip()
 
 # -----------------------------
-# Main UI
+# Fun stepper / progress
 # -----------------------------
+step = 1
+if st.session_state["did_search"]:
+    step = 2
+if st.session_state["docs"]:
+    step = 3
+
+st.progress(step / 3)
+st.caption(f"Step {step} of 3")
+
 st.divider()
-st.subheader("1) Tell me the industry you want to research")
-industry = st.text_input(
-    "Industry",
-    placeholder="Example: online language learning, EV charging, pet food",
-    label_visibility="collapsed",
-)
+
+# -----------------------------
+# Step 1: Form (stable UI)
+# -----------------------------
+st.subheader("1) What industry should I research 🧠")
+
+with st.form("search_form", clear_on_submit=False):
+    industry = st.text_input(
+        "Industry",
+        placeholder="Example: online language learning, EV charging, pet food",
+        value=st.session_state["industry"],
+        label_visibility="collapsed",
+    )
+    clarification = st.text_input(
+        "Optional hint (keeps results accurate)",
+        placeholder="Example: UK market, mobile apps, subscription, B2B…",
+        value=st.session_state["clarification"],
+    )
+    submitted = st.form_submit_button("🔍 Find Wikipedia pages", use_container_width=True)
 
 if not looks_like_input(industry):
-    st.warning("Type an industry to continue")
+    st.info("Type an industry above to begin")
     st.stop()
 
-# Session state to allow “ask for more context” flow without clutter
-if "clarification" not in st.session_state:
-    st.session_state.clarification = ""
+if submitted:
+    st.session_state["industry"] = industry.strip()
+    st.session_state["clarification"] = clarification.strip()
+    st.session_state["did_search"] = True
+    st.session_state["docs"] = None
+    st.session_state["report"] = ""
+    st.rerun()
 
-st.subheader("2) I’ll find the most relevant Wikipedia pages")
-colA, colB = st.columns([1, 2], vertical_alignment="center")
+# -----------------------------
+# Step 2: Retrieve pages (auto after submit)
+# -----------------------------
+if st.session_state["did_search"] and not st.session_state["docs"]:
+    st.subheader("2) Finding the best Wikipedia pages 📚")
 
-with colA:
-    fetch_clicked = st.button("Find Wikipedia pages", type="primary", use_container_width=True)
+    query_base = st.session_state["industry"]
+    if st.session_state["clarification"]:
+        query_base = f"{query_base} ({st.session_state['clarification']})"
 
-with colB:
-    st.caption("Tip: If your industry term is vague, I may ask you to clarify so the report stays accurate")
-
-docs = None
-query_used = None
-
-if fetch_clicked:
-    with st.status("Searching Wikipedia…", expanded=False) as status:
-        # If we already have clarification, use it to disambiguate
-        query_base = industry
-        if st.session_state.clarification.strip():
-            query_base = f"{industry} ({st.session_state.clarification.strip()})"
-
+    with st.status("🕵️ Searching Wikipedia…", expanded=False) as status:
         docs, query_used = get_docs_with_fallbacks(query_base)
-        status.update(label="Wikipedia search completed", state="complete")
+        status.update(label="✅ Wikipedia search completed", state="complete")
 
     if not docs or should_ask_for_more_context(docs):
-        st.warning(build_clarifying_questions(industry))
-        st.session_state.clarification = st.text_area(
-            "Add a short clarification (then click “Find Wikipedia pages” again)",
-            placeholder="Example: mobile apps, subscription-based, UK market, B2C learners…",
-            height=90,
-        )
+        st.warning(build_clarifying_questions(st.session_state["industry"]))
         st.stop()
 
-    # Show 5 results as clean, clickable titles
-    st.markdown("Here are the 5 most relevant Wikipedia pages I found")
-    shown = 0
-    for d in docs:
-        url = extract_url(d)
-        title = extract_title(d)
-        if url:
-            shown += 1
-            st.markdown(f"- [{title}]({url})")
-        if shown >= 5:
-            break
-
-    if shown < 5:
-        st.info("I retrieved page content successfully, but some results didn’t include a clean URL in metadata")
-
-    # Store docs in session so Step 3 can run without re-fetching
     st.session_state["docs"] = docs
     st.session_state["query_used"] = query_used
+    st.rerun()
 
-# If pages already fetched earlier, display them again (nice UX)
-if "docs" in st.session_state and st.session_state["docs"]:
-    st.subheader("3) Generate your industry report")
-    st.caption("Report rules: <500 words, and based only on the 5 Wikipedia pages above")
+# -----------------------------
+# Display Step 2 results (cards)
+# -----------------------------
+if st.session_state["docs"]:
+    st.subheader("2) Wikipedia pages I used 📚")
+    st.caption("These are the sources for the report (5 pages)")
 
-    if st.button("Generate report", use_container_width=True):
+    for i, d in enumerate(st.session_state["docs"][:TOP_K], start=1):
+        title = extract_title(d)
+        url = extract_url(d)
+
+        with st.container(border=True):
+            st.markdown(f"**{i}. {title}**")
+            if url:
+                st.markdown(f"[Open page]({url})")
+            else:
+                st.caption("URL not available for this result, but content was retrieved")
+
+# -----------------------------
+# Step 3: Generate report
+# -----------------------------
+if st.session_state["docs"]:
+    st.subheader("3) Your industry report ✍️")
+    st.caption("Rules: under 500 words, and only based on the Wikipedia pages above")
+
+    gen = st.button("🧾 Generate my report", type="primary", use_container_width=True)
+
+    if gen:
         docs = st.session_state["docs"]
+        context = "\n\n".join([d.page_content for d in docs[:TOP_K]]).strip()
 
-        context_chunks = [d.page_content for d in docs[:TOP_K]]
-        context = "\n\n".join(context_chunks).strip()
-
-        # Hard instruction: if insufficient/ambiguous, ask questions only (no hallucination)
         prompt = f"""
-You are a market research assistant for a business analyst at a large corporation
+You are a market research assistant for a business analyst at a large corporation.
 
-Write an industry report about: {industry}
+Write an industry report about: {st.session_state["industry"]}
 
 Rules:
 - Use ONLY the Wikipedia context below
@@ -203,30 +232,32 @@ Wikipedia context:
 {context}
 """.strip()
 
-        with st.status("Writing report…", expanded=False) as status:
+        with st.status("🤖 Writing your report…", expanded=False) as status:
             output = llm.invoke(prompt).content.strip()
-            status.update(label="Done", state="complete")
+            status.update(label="✅ Done", state="complete")
 
-        # If model asks questions, show them and stop
-        if output.count("?") >= 2 and word_count(output) < 180:
+        # If it looks like questions instead of a report, show and stop
+        if output.count("?") >= 2 and word_count(output) < 200:
             st.warning(output)
-            st.session_state.clarification = st.text_area(
-                "Add a short clarification (then click “Find Wikipedia pages” again)",
-                placeholder="Example: mobile apps, subscription-based, UK market, B2C learners…",
-                height=90,
-            )
             st.stop()
 
         report = enforce_under_500_words(output)
+        st.session_state["report"] = report
+        st.rerun()
 
-        st.markdown("### Industry report")
-        st.write(report)
+# -----------------------------
+# Show report if available
+# -----------------------------
+if st.session_state["report"]:
+    st.markdown("### ✅ Industry report")
+    st.write(st.session_state["report"])
 
-        st.download_button(
-            "Download report (TXT)",
-            data=report,
-            file_name="industry_report.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
+    st.caption(f"Word count: {word_count(st.session_state['report'])} (must be under 500)")
 
+    st.download_button(
+        "⬇️ Download report (TXT)",
+        data=st.session_state["report"],
+        file_name="industry_report.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
