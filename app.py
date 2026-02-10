@@ -370,7 +370,7 @@ Wikipedia context:
 # -----------------------------
 if st.session_state["report"]:
     st.markdown("### Report")
-    st.write(st.session_state["report"])
+    st.markdown(st.session_state["report"])
 
     wc = word_count(st.session_state["report"])
     st.caption(f"Word count: {wc} / 500")
