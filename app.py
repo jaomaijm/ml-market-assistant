@@ -43,7 +43,7 @@ with st.sidebar.form("api_form", clear_on_submit=False):
     # Dropdown for selecting LLM
     llm_option = st.selectbox(
         "Select LLM",
-        options=["gpt-4.1-mini", "gpt-3.5-turbo"],  # Add more models here if needed
+        options=["gpt-4.1-mini"],  # Add more models here if needed
         index=0
     )
     
