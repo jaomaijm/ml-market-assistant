@@ -336,17 +336,45 @@ if st.session_state["stage"] in ["ready", "reported"] and st.session_state["docs
         context = "\n\n".join([d.page_content for d in docs[:TOP_K]]).strip()
 
         prompt = f"""
-You are a market research assistant for a business analyst at a large corporation.
+You are a market research assistant writing a clean Markdown brief.
 
-Write an industry report about: {st.session_state["industry"]}
+Topic:
+{st.session_state["industry"]}
 
-Rules:
+Hard rules:
 - Use ONLY the Wikipedia context below
-- Do NOT invent facts, numbers, competitors, trends, or claims not supported by the context
-- If the context is insufficient or ambiguous, output ONLY a short list of clarifying questions (no report)
-- Keep the report STRICTLY UNDER 500 words (target 420–480)
-- Use clear headings and bullet points where helpful
-- End with "Limits of this report"
+- Do NOT invent facts, numbers, competitors, or claims not supported by the context
+- If the context is too generic / definition-heavy OR not clearly about the industry/market, output ONLY 3–5 clarifying questions (no report)
+- STRICTLY under 500 words (target 420–480)
+- Do NOT use separators like "---"
+- Do NOT put headings in the same line as normal text
+- Keep formatting clean: headings + short paragraphs + bullets
+
+Output format (follow exactly):
+
+## Industry brief: <clean industry name>
+
+### Scope
+(1–2 sentences)
+
+### Market offering (what customers buy)
+- bullet
+- bullet
+
+### Value chain (how money flows)
+- bullet
+- bullet
+
+### Competitive landscape (categories only)
+- bullet
+- bullet
+
+### Key trends and drivers
+- bullet
+- bullet
+
+### Limits of this report
+(1–2 sentences)
 
 Wikipedia context:
 {context}
