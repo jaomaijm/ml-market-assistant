@@ -104,17 +104,48 @@ def enforce_under_500_words(text: str, limit: int = 500, max_rounds: int = 3) ->
         if word_count(current) <= limit:
             return current
 
-        compress_prompt = f"""
-Shorten the report to UNDER {limit} words.
+        prompt = f"""
+You are a market research assistant writing a short, clean, professional brief in Markdown.
 
-Rules:
-- Keep the same structure and headings
-- Remove low-importance details first
-- Do not add any new facts
-- Output ONLY the revised report text
+Topic:
+{st.session_state["industry"]}
 
-Report to shorten:
-{current}
+Hard rules:
+- Use ONLY the Wikipedia context below
+- Do NOT invent facts, numbers, competitors, or claims not supported by the context
+- If the context is not clearly about the industry/market (too generic/definition-heavy), output ONLY 3–5 clarifying questions (no report)
+- Keep the report STRICTLY UNDER 500 words (target 420–480)
+- Do NOT use separators like "---" or "—" lines
+- Keep formatting simple: headings + short text + bullet points
+
+Output format (follow exactly):
+
+## Industry brief: <clean industry name>
+
+### Scope
+(1–2 sentences)
+
+### Market offering (what customers buy)
+- bullet
+- bullet
+
+### Value chain (how money flows)
+- bullet
+- bullet
+
+### Competitive landscape (categories only)
+- bullet
+- bullet
+
+### Key trends and drivers
+- bullet
+- bullet
+
+### Limits of this report
+(1–2 sentences)
+
+Wikipedia context:
+{context}
 """.strip()
 
         current = llm.invoke(compress_prompt).content.strip()
