@@ -351,7 +351,7 @@ if st.session_state["report"]:
     st.caption(f"Word count: {wc} / 500")
 
     # Download status area
-    if st.session_state["report"]:
+   if st.session_state["report"]:
     st.markdown("### Report")
     st.write(st.session_state["report"])
 
@@ -365,6 +365,7 @@ if st.session_state["report"]:
         mime="text/plain",
         use_container_width=True,
     )
+
 
     d1, d2 = st.columns(2)
     with d1:
