@@ -346,12 +346,25 @@ Wikipedia context:
 if st.session_state["report"]:
     st.markdown("### Report")
     st.write(st.session_state["report"])
+      # Word count
+    wc = word_count(st.session_state["report"])
+    st.caption(f"Word count: {wc} / 500")
 
     # Download status area
-    if st.session_state["download_ready"]:
-        st.success("Report is ready to download")
-    if st.session_state["download_preparing"]:
-        st.info("Preparing download...")
+    if st.session_state["report"]:
+    st.markdown("### Report")
+    st.write(st.session_state["report"])
+
+    wc = word_count(st.session_state["report"])
+    st.caption(f"Word count: {wc} / 500")
+
+    st.download_button(
+        "Download report (TXT)",
+        data=st.session_state["report"],
+        file_name="industry_report.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
 
     d1, d2 = st.columns(2)
     with d1:
