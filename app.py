@@ -32,16 +32,25 @@ for k, v in defaults.items():
         st.session_state[k] = v
 
 # -----------------------------
-# Sidebar: API key + link + reset
+# Sidebar: API key + LLM selection + reset
 # -----------------------------
-st.sidebar.header("API Key")
+st.sidebar.header("API Key & LLM")
 
 with st.sidebar.form("api_form", clear_on_submit=False):
+    # API key input
     api_key = st.text_input("OpenAI API key", type="password", placeholder="sk-...")
+    
+    # Dropdown for selecting LLM
+    llm_option = st.selectbox(
+        "Select LLM",
+        options=["gpt-4.1-mini", "gpt-3.5-turbo"],  # Add more models here if needed
+        index=0
+    )
+    
+    # Submit button
     api_submitted = st.form_submit_button("Use this key", use_container_width=True)
 
 st.sidebar.caption("Your API key is used only for this session to run the app and is not stored")
-
 st.sidebar.markdown("[Get an API key](https://platform.openai.com/api-keys)")
 
 if st.sidebar.button("Reset", use_container_width=True):
@@ -49,11 +58,13 @@ if st.sidebar.button("Reset", use_container_width=True):
         st.session_state[k] = defaults[k]
     st.rerun()
 
-# Persist key for session only (do not store it anywhere else)
+# Persist key and selected LLM for session only (do not store it anywhere else)
 if api_submitted:
     st.session_state["api_key_session"] = api_key
+    st.session_state["llm_option"] = llm_option  # Storing the selected LLM
 
 api_key_session = st.session_state.get("api_key_session", "")
+llm_option = st.session_state.get("llm_option", "gpt-4.1-mini")  # Default to 'gpt-4.1-mini' if not selected
 
 if not api_key_session:
     st.info("Enter your OpenAI API key in the sidebar and click “Use this key” to begin")
