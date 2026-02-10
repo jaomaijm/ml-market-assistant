@@ -104,51 +104,24 @@ def enforce_under_500_words(text: str, limit: int = 500, max_rounds: int = 3) ->
         if word_count(current) <= limit:
             return current
 
-        prompt = f"""
-You are a market research assistant writing a short, clean, professional brief in Markdown.
+        compress_prompt = f"""
+Shorten this report to UNDER {limit} words.
 
-Topic:
-{st.session_state["industry"]}
+Rules:
+- Keep headings and bullets
+- Remove less important details first
+- Do NOT add new facts
+- Output ONLY the revised text
 
-Hard rules:
-- Use ONLY the Wikipedia context below
-- Do NOT invent facts, numbers, competitors, or claims not supported by the context
-- If the context is not clearly about the industry/market (too generic/definition-heavy), output ONLY 3–5 clarifying questions (no report)
-- Keep the report STRICTLY UNDER 500 words (target 420–480)
-- Do NOT use separators like "---" or "—" lines
-- Keep formatting simple: headings + short text + bullet points
-
-Output format (follow exactly):
-
-## Industry brief: <clean industry name>
-
-### Scope
-(1–2 sentences)
-
-### Market offering (what customers buy)
-- bullet
-- bullet
-
-### Value chain (how money flows)
-- bullet
-- bullet
-
-### Competitive landscape (categories only)
-- bullet
-- bullet
-
-### Key trends and drivers
-- bullet
-- bullet
-
-### Limits of this report
-(1–2 sentences)
-
-Wikipedia context:
-{context}
+Report:
+{current}
 """.strip()
 
         current = llm.invoke(compress_prompt).content.strip()
+
+    tokens = current.split()
+    return " ".join(tokens[:limit])
+    
 
     # Last resort: hard trim to limit words (keeps app compliant even if model fails)
     words = re.findall(r"\b\w+\b", current)
