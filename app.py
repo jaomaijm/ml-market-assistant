@@ -92,15 +92,41 @@ def retrieve_wikipedia_docs(query: str):
     retriever = WikipediaRetriever(top_k_results=TOP_K, lang=LANG)
     return retriever.invoke(query)
 
-def enforce_under_500_words(text: str) -> str:
-    if word_count(text) <= 500:
-        return text
-    compress_prompt = (
-        "Shorten the report to UNDER 500 words.\n"
-        "Keep headings and key points.\n\n"
-        f"{text}"
-    )
-    return llm.invoke(compress_prompt).content.strip()
+def enforce_under_500_words(text: str, limit: int = 500, max_rounds: int = 3) -> str:
+    """
+    Guarantees the final text is <= limit words.
+    1) Ask the model to compress (up to max_rounds times)
+    2) If still too long, hard-trim by words (last resort)
+    """
+    current = (text or "").strip()
+
+    for _ in range(max_rounds):
+        if word_count(current) <= limit:
+            return current
+
+        compress_prompt = f"""
+Shorten the report to UNDER {limit} words.
+
+Rules:
+- Keep the same structure and headings
+- Remove low-importance details first
+- Do not add any new facts
+- Output ONLY the revised report text
+
+Report to shorten:
+{current}
+""".strip()
+
+        current = llm.invoke(compress_prompt).content.strip()
+
+    # Last resort: hard trim to limit words (keeps app compliant even if model fails)
+    words = re.findall(r"\b\w+\b", current)
+    if len(words) <= limit:
+        return current
+
+    # Trim by splitting on whitespace to preserve readability better than regex token list
+    tokens = current.split()
+    return " ".join(tokens[:limit])
 
 def assess_relevance(industry: str, docs) -> dict:
     titles = [extract_title(d) for d in docs[:TOP_K]]
@@ -314,7 +340,7 @@ Rules:
 - Use ONLY the Wikipedia context below
 - Do NOT invent facts, numbers, competitors, trends, or claims not supported by the context
 - If the context is insufficient or ambiguous, output ONLY a short list of clarifying questions (no report)
-- Keep the report UNDER 500 words
+- Keep the report STRICTLY UNDER 500 words (target 420–480)
 - Use clear headings and bullet points where helpful
 - End with "Limits of this report"
 
