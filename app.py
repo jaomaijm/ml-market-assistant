@@ -355,30 +355,5 @@ if st.session_state["report"]:
         file_name="industry_report.txt",
         mime="text/plain",
         use_container_width=True,
+        key="download_report_txt",
     )
-    d1, d2 = st.columns(2)
-    with d1:
-        # Simulated "preparing" status on click (Streamlit doesn't expose actual file-transfer progress)
-        prep = st.button("Prepare download", use_container_width=True)
-    with d2:
-        download_disabled = not st.session_state["download_ready"] or st.session_state["download_preparing"]
-        download_clicked = st.download_button(
-            "Download report (TXT)",
-            data=st.session_state["report"],
-            file_name="industry_report.txt",
-            mime="text/plain",
-            use_container_width=True,
-            disabled=download_disabled,
-        )
-
-    if prep:
-        st.session_state["download_preparing"] = True
-        st.session_state["download_ready"] = False
-        st.rerun()
-
-    if st.session_state["download_preparing"]:
-        # Small delay to make status visible and feel responsive
-        time.sleep(0.6)
-        st.session_state["download_preparing"] = False
-        st.session_state["download_ready"] = True
-        st.rerun()
