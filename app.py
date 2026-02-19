@@ -34,7 +34,6 @@ defaults = {
     "report": "",
     "api_key_session": "",
     "llm_option": "gpt-4.1-mini",
-    # NEW for Step 3 selection UI
     "step3_pick_labels": [],
 }
 for k, v in defaults.items():
@@ -74,6 +73,10 @@ llm = ChatOpenAI(model=MODEL_NAME, openai_api_key=api_key_session, temperature=0
 
 TOP_K = 5
 LANG = "en"
+
+# Relevance interpretation (shown to user)
+STRONG_MATCH_MIN = 70
+RELATED_MIN = 60
 
 # =========================================================
 # Helpers
@@ -346,6 +349,44 @@ Wikipedia context:
     out = llm.invoke(prompt).content.strip()
     return enforce_under_500_words(out)
 
+def relevance_bucket(score: int) -> str:
+    if score >= STRONG_MATCH_MIN:
+        return "Strong match"
+    if score >= RELATED_MIN:
+        return "Related"
+    return "Weak match"
+
+def explain_choice(topic: str, title: str, snippet: str, score: int) -> str:
+    snippet = (snippet or "").strip().replace("\n", " ")
+    snippet = snippet[:900]
+    prompt = f"""
+You are helping a user choose which Wikipedia pages to use for a market research report.
+
+User topic:
+{topic}
+
+Page title:
+{title}
+
+Relevance score (0-100):
+{score}
+
+Page snippet:
+{snippet}
+
+Write ONE short reason (max 18 words) explaining why this page might be useful.
+Rules:
+- If score < {STRONG_MATCH_MIN}, be transparent that it's broad/partial and mention what it covers instead
+- Do NOT invent facts beyond snippet/title
+- Output ONLY the reason sentence
+""".strip()
+
+    try:
+        reason = llm.invoke(prompt).content.strip()
+    except Exception:
+        reason = "Covers a related topic area, but may be broader than your exact market focus."
+    return reason
+
 # =========================================================
 # UI
 # =========================================================
@@ -410,6 +451,11 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
         f"**Current topic:** {st.session_state.get('final_query','').strip() or st.session_state.get('industry','').strip()}"
     )
 
+    st.caption(
+        f"Relevance score guide: {STRONG_MATCH_MIN}–100 = Strong match, "
+        f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match"
+    )
+
     # 2.0 First attempt (auto)
     if not st.session_state.get("ranked"):
         with st.spinner("Searching Wikipedia and ranking results..."):
@@ -440,10 +486,9 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
         for i, r in enumerate(display_list, 1):
             title, url, score = r["title"], r["url"], r["score"]
             st.markdown(f"**{i}. {title}**  \n{url}")
-            st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100")
+            st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100 ({relevance_bucket(score)})")
 
         st.caption("Step 3 will let you choose which pages to base the report on")
-
         go_step3 = st.button("Continue to Step 3", type="primary", use_container_width=True)
         if go_step3:
             st.session_state["selected_urls"] = [r["url"] for r in display_list if r.get("url")]
@@ -584,7 +629,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                     label = f"{i}. {title} ({score}/100)"
                     url_options.append((label, url))
                     st.markdown(f"**{label}**  \n{url}")
-                    st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100")
+                    st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100 ({relevance_bucket(score)})")
 
                 chosen_labels = st.multiselect(
                     "Select pages to carry into Step 3 (recommended: pick 3–5)",
@@ -616,19 +661,33 @@ if st.session_state.get("step", 1) >= 3:
         st.info("Complete Step 2 first to retrieve Wikipedia pages")
         st.stop()
 
-    # Build options from the ranked list (do NOT re-display as Step 2)
     display_list = ranked_all[:TOP_K]
+
+    st.caption(
+        f"How to choose pages: {STRONG_MATCH_MIN}–100 = Strong match, "
+        f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match. "
+        "If you see low scores, pick pages that still describe your market angle best"
+    )
+
+    # Build options with reasons (expanders)
     url_options = []
+    url_to_reason = {}
     for i, r in enumerate(display_list, 1):
-        title, url, score = r.get("title", "Wikipedia page"), r.get("url", ""), r.get("score", 0)
-        label = f"{i}. {title} ({score}/100)"
+        title = r.get("title", "Wikipedia page")
+        url = r.get("url", "")
+        score = int(r.get("score", 0))
+        label = f"{i}. {title} ({score}/100 • {relevance_bucket(score)})"
         url_options.append((label, url))
 
-    # Default selection: if Step 2 already set selected_urls, keep it; otherwise choose all displayed
+        snippet = (getattr(r.get("doc"), "page_content", "") or "")
+        url_to_reason[url] = explain_choice(topic_for_report, title, snippet, score)
+
+    # Default selection: keep Step 2 selection if available
     prev_selected = st.session_state.get("selected_urls", [])
     default_labels = [lbl for (lbl, u) in url_options if (u in prev_selected)] if prev_selected else [lbl for (lbl, _) in url_options]
 
     st.markdown(f"**Report topic:** {topic_for_report}")
+
     st.markdown("**Choose which pages to use for the report:**")
     chosen_labels_step3 = st.multiselect(
         "Select pages (3–5 recommended)",
@@ -640,14 +699,19 @@ if st.session_state.get("step", 1) >= 3:
     chosen_urls_step3 = [u for (lbl, u) in url_options if lbl in chosen_labels_step3 and u]
     st.session_state["selected_urls"] = chosen_urls_step3
 
-    # Determine docs to use based on selection
-    docs_to_use = []
     if chosen_urls_step3:
-        url_set = set(chosen_urls_step3)
-        docs_to_use = [r["doc"] for r in ranked_all if r.get("url") in url_set]
-    else:
+        with st.expander("Why these pages might help (quick reasons)"):
+            for (lbl, url) in url_options:
+                if url in chosen_urls_step3:
+                    st.markdown(f"- **{lbl}**  \n  {url_to_reason.get(url, '')}")
+
+    # Determine docs to use based on selection
+    if not chosen_urls_step3:
         st.warning("Please select at least 1 page to generate the report")
         st.stop()
+
+    url_set = set(chosen_urls_step3)
+    docs_to_use = [r["doc"] for r in ranked_all if r.get("url") in url_set]
 
     gen_col1, gen_col2 = st.columns(2)
     with gen_col1:
