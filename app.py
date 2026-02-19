@@ -3,272 +3,286 @@ import streamlit as st
 from langchain_community.retrievers import WikipediaRetriever
 from langchain_openai import ChatOpenAI
 
-# -----------------------------
-# Page setup
-# -----------------------------
-st.set_page_config(page_title="Market Research Assistant", page_icon="📊", layout="wide")
-st.title("📊 Market Research Assistant")
-st.caption("Structured industry research assistant with clarification + relevance ranking.")
+# ==========================================================
+# PAGE CONFIG
+# ==========================================================
+st.set_page_config(page_title="Market Research Assistant", page_icon="🔎", layout="wide")
+st.title("Market Research Assistant")
 
-# -----------------------------
-# Session State
-# -----------------------------
+st.caption(
+    "Step 1: Enter industry → "
+    "Step 2: System finds 5 most relevant Wikipedia pages → "
+    "Step 3: Generate structured report under 500 words"
+)
+
+# ==========================================================
+# SESSION STATE
+# ==========================================================
 defaults = {
     "stage": "start",
     "industry": "",
-    "clarification": "",
+    "docs": [],
+    "ranked_docs": [],
     "clarification_round": 0,
-    "docs": None,
-    "final_docs": None,
-    "report": ""
+    "confidence": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# -----------------------------
-# Sidebar
-# -----------------------------
-st.sidebar.header("Configuration")
+# ==========================================================
+# SIDEBAR
+# ==========================================================
+st.sidebar.header("API Key")
 
-with st.sidebar.form("api_form"):
-    api_key = st.text_input("OpenAI API Key", type="password")
-    llm_option = st.selectbox("Select LLM", ["gpt-4.1-mini"])
-    submitted = st.form_submit_button("Use Key")
+api_key = st.sidebar.text_input("OpenAI API Key", type="password")
 
-if submitted:
-    st.session_state["api_key"] = api_key
-    st.session_state["llm_option"] = llm_option
-
-if "api_key" not in st.session_state or not st.session_state["api_key"]:
-    st.info("Enter API key to begin.")
+if not api_key:
+    st.info("Enter your OpenAI API key in the sidebar to begin")
     st.stop()
 
 llm = ChatOpenAI(
-    model=st.session_state["llm_option"],
-    openai_api_key=st.session_state["api_key"],
+    model="gpt-4.1-mini",
+    openai_api_key=api_key,
     temperature=0.2
 )
 
-TOP_K = 8
+TOP_K = 10
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def extract_title(doc):
-    return doc.metadata.get("title", "Wikipedia Page")
-
+# ==========================================================
+# HELPERS
+# ==========================================================
 def extract_url(doc):
-    return doc.metadata.get("source", "")
+    md = getattr(doc, "metadata", {}) or {}
+    return md.get("source") or md.get("url") or ""
 
-def word_count(text):
-    return len(re.findall(r"\b\w+\b", text))
-
-def enforce_under_500(text):
-    if word_count(text) <= 500:
-        return text
-    return " ".join(text.split()[:500])
+def extract_title(doc):
+    md = getattr(doc, "metadata", {}) or {}
+    return md.get("title") or "Wikipedia Page"
 
 def retrieve_docs(query):
     retriever = WikipediaRetriever(top_k_results=TOP_K, lang="en")
     return retriever.invoke(query)
 
-def check_ambiguity(industry):
-    prompt = f"""
-User industry input:
-{industry}
-
-If this industry is too broad or ambiguous, ask 2-3 short clarifying questions.
-If clear enough for retrieval, output exactly: CLEAR
-"""
-    result = llm.invoke(prompt).content.strip()
-    return result
-
 def rank_documents(industry, docs):
-    scored = []
-
+    ranked = []
     for d in docs:
+        title = extract_title(d)
+        preview = d.page_content[:800]
+
         prompt = f"""
-Industry:
-{industry}
+Score relevance of this Wikipedia page to "{industry}".
+Respond with ONLY a number 0–100.
 
-Page title:
-{extract_title(d)}
-
-Snippet:
-{d.page_content[:800]}
-
-Score relevance 0-10.
-Only output number.
+Title: {title}
+Content: {preview}
 """
         try:
-            score = float(re.findall(r"\d+\.?\d*", llm.invoke(prompt).content)[0])
+            score_text = llm.invoke(prompt).content.strip()
+            score = int(re.findall(r"\d+", score_text)[0])
         except:
-            score = 0
-        scored.append((d, score))
+            score = 50
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+        ranked.append((score, d))
 
-    strong = [d for d, s in scored if s >= 7]
-    weak = [d for d, s in scored if s < 7]
+    ranked.sort(reverse=True, key=lambda x: x[0])
+    return ranked
 
-    return strong, weak
+def word_count(text):
+    return len(re.findall(r"\b\w+\b", text))
 
-# -----------------------------
-# STEP 1: Industry Input
-# -----------------------------
+def enforce_under_500(text):
+    words = text.split()
+    return " ".join(words[:500])
+
+# ==========================================================
+# STEP 1 – USER INPUT
+# ==========================================================
+st.divider()
 st.subheader("Step 1: Enter Industry")
 
-industry_input = st.text_input("Industry")
+industry_input = st.text_input(
+    "Industry",
+    placeholder="Example: Exotic Pet Care Services"
+)
 
-if st.button("Continue", type="primary"):
+if st.button("Find Relevant Pages", type="primary"):
+
     if not industry_input.strip():
-        st.warning("Please enter industry.")
+        st.warning("Please enter an industry.")
         st.stop()
 
-    st.session_state["industry"] = industry_input
-    st.session_state["clarification_round"] = 1
+    st.session_state.industry = industry_input.strip()
+    st.session_state.clarification_round = 0
 
-    result = check_ambiguity(industry_input)
+    with st.spinner("Retrieving and ranking pages..."):
+        docs = retrieve_docs(industry_input)
+        ranked = rank_documents(industry_input, docs)
 
-    if result == "CLEAR":
-        st.session_state["stage"] = "retrieve"
+    st.session_state.ranked_docs = ranked
+
+    top_scores = [r[0] for r in ranked[:5]]
+
+    if len(top_scores) >= 5 and all(s >= 70 for s in top_scores):
+        st.session_state.docs = [r[1] for r in ranked[:5]]
+        st.session_state.stage = "ready"
+        st.session_state.confidence = "high"
     else:
-        st.session_state["clarification_questions"] = result
-        st.session_state["stage"] = "clarify"
+        st.session_state.stage = "clarification"
+        st.session_state.clarification_round = 1
 
-# -----------------------------
-# STEP 2: Clarification Flow
-# -----------------------------
-if st.session_state["stage"] == "clarify":
+    st.rerun()
 
-    st.subheader("Clarification Needed")
+# ==========================================================
+# STEP 2 – CLARIFICATION ROUND 1
+# ==========================================================
+if st.session_state.stage == "clarification" and st.session_state.clarification_round == 1:
 
-    st.info(st.session_state["clarification_questions"])
+    st.subheader("Step 2: Clarification Needed")
+    st.warning("System is not fully confident about the top 5 URLs.")
 
-    clarification = st.text_input("Provide more context (country, segment, B2B/B2C etc.)")
+    clarification = st.text_input("Add clarification (country, niche, B2B/B2C etc.)")
 
-    if st.button("Submit Clarification"):
+    if st.button("Refine Search"):
 
-        combined_input = st.session_state["industry"] + " " + clarification
-        result = check_ambiguity(combined_input)
+        refined_query = f"{st.session_state.industry} {clarification}"
 
-        if result == "CLEAR":
-            st.session_state["industry"] = combined_input
-            st.session_state["stage"] = "retrieve"
+        with st.spinner("Re-ranking..."):
+            docs = retrieve_docs(refined_query)
+            ranked = rank_documents(refined_query, docs)
 
+        st.session_state.ranked_docs = ranked
+
+        top_scores = [r[0] for r in ranked[:5]]
+
+        if len(top_scores) >= 5 and all(s >= 70 for s in top_scores):
+            st.session_state.docs = [r[1] for r in ranked[:5]]
+            st.session_state.stage = "ready"
         else:
-            # Second round escalation
-            if st.session_state["clarification_round"] == 1:
-                st.session_state["clarification_round"] = 2
-                st.session_state["clarification_questions"] = (
-                    "Please specify keywords such as:\n"
-                    "- Country\n"
-                    "- Customer type\n"
-                    "- Specific product category\n"
-                    "- Market scope (global / regional)"
-                )
-            else:
-                st.session_state["industry"] = combined_input
-                st.session_state["stage"] = "retrieve"
+            st.session_state.stage = "force_keywords"
+            st.session_state.clarification_round = 2
 
-# -----------------------------
-# STEP 3: Retrieve + Rank
-# -----------------------------
-if st.session_state["stage"] == "retrieve":
+        st.rerun()
 
-    st.subheader("Step 2: Retrieving Wikipedia Pages")
+# ==========================================================
+# STEP 2 – FORCED KEYWORDS ROUND 2
+# ==========================================================
+if st.session_state.stage == "force_keywords":
 
-    with st.spinner("Searching..."):
-        docs = retrieve_docs(st.session_state["industry"])
+    st.subheader("Step 2: Select Specific Direction")
+    st.warning("Still uncertain. Choose a more specific focus.")
 
-    if not docs:
-        st.error("No pages found.")
-        st.stop()
+    keyword_prompt = f"""
+Generate 5 specific sub-keywords related to: {st.session_state.industry}
+Return comma-separated only.
+"""
+    keywords_text = llm.invoke(keyword_prompt).content
+    keywords = [k.strip() for k in keywords_text.split(",")]
 
-    strong, weak = rank_documents(st.session_state["industry"], docs)
+    selected = None
+    cols = st.columns(len(keywords))
 
-    if len(strong) >= 5:
-        st.success("5 highly relevant pages found.")
-        st.session_state["final_docs"] = strong[:5]
+    for i, k in enumerate(keywords):
+        if cols[i].button(k):
+            selected = k
 
-        for i, d in enumerate(strong[:5], 1):
-            st.markdown(f"**{i}. {extract_title(d)}**  \n{extract_url(d)}")
+    manual = st.text_input("Or type your own keyword")
 
-        st.session_state["stage"] = "ready"
+    final = selected if selected else manual
 
-    else:
-        st.warning(f"Only {len(strong)} strongly relevant pages found.")
+    if final:
+        final_query = f"{st.session_state.industry} {final}"
 
-        fallback = weak[:5 - len(strong)]
-        combined = strong + fallback
+        with st.spinner("Final ranking..."):
+            docs = retrieve_docs(final_query)
+            ranked = rank_documents(final_query, docs)
 
-        titles = [extract_title(d) for d in combined]
+        st.session_state.ranked_docs = ranked
+        st.session_state.docs = [r[1] for r in ranked[:5]]
+        st.session_state.stage = "ready"
+        st.rerun()
 
-        selected = st.multiselect(
-            "Select pages for report:",
-            titles,
-            default=titles
+# ==========================================================
+# STEP 2 – SHOW RANKED URLS
+# ==========================================================
+if st.session_state.stage == "ready":
+
+    st.subheader("Step 2: Top Retrieved Pages")
+
+    ranked = st.session_state.ranked_docs
+    strong = [r for r in ranked if r[0] >= 70]
+
+    if len(strong) < 5:
+        st.info(
+            f"{len(strong)} highly relevant pages found (score ≥70). "
+            "Other pages shown are best available matches."
         )
 
-        selected_docs = [d for d in combined if extract_title(d) in selected]
+    for score, doc in ranked[:5]:
+        title = extract_title(doc)
+        url = extract_url(doc)
 
-        if selected_docs and st.button("Confirm Selection"):
-            st.session_state["final_docs"] = selected_docs
-            st.session_state["stage"] = "ready"
+        st.markdown(f"**{title}**")
+        st.caption(f"Relevance score: {score}/100")
+        if url:
+            st.markdown(url)
+        st.markdown("---")
 
-# -----------------------------
-# STEP 4: Generate Report
-# -----------------------------
-if st.session_state["stage"] == "ready":
+# ==========================================================
+# STEP 3 – GENERATE REPORT
+# ==========================================================
+if st.session_state.stage == "ready" and st.session_state.docs:
 
     st.subheader("Step 3: Generate Report")
 
     if st.button("Generate Report", type="primary"):
 
-        context = "\n\n".join([d.page_content for d in st.session_state["final_docs"]])
+        context = "\n\n".join([d.page_content for d in st.session_state.docs])
 
         prompt = f"""
-Write a structured industry brief under 500 words.
+You are a professional market research analyst.
 
-Industry:
-{st.session_state["industry"]}
+STRICT RULES:
+- Use ONLY the Wikipedia context provided
+- Do NOT invent facts
+- Under 500 words
+- Clean Markdown structure
 
-Use ONLY the context below.
+Format exactly:
 
-Format:
-
-## Industry Brief
+## Industry Brief: {st.session_state.industry}
 
 ### Scope
-### Market Offering
-### Value Chain
-### Competitive Landscape
-### Key Trends
-### Limits
+(1–2 sentences)
 
-Context:
+### Market Offering
+- bullet
+- bullet
+
+### Value Chain
+- bullet
+- bullet
+
+### Competitive Landscape
+- bullet
+- bullet
+
+### Key Trends
+- bullet
+- bullet
+
+### Limits
+(1–2 sentences)
+
+Wikipedia Context:
 {context}
 """
 
-        with st.spinner("Generating..."):
-            output = llm.invoke(prompt).content
+        with st.spinner("Generating report..."):
+            report = llm.invoke(prompt).content.strip()
 
-        report = enforce_under_500(output)
-        st.session_state["report"] = report
-        st.session_state["stage"] = "done"
+        report = enforce_under_500(report)
 
-# -----------------------------
-# OUTPUT
-# -----------------------------
-if st.session_state["stage"] == "done":
-    st.subheader("Industry Report")
-    st.markdown(st.session_state["report"])
-    st.caption(f"Word count: {word_count(st.session_state['report'])}/500")
-
-    st.download_button(
-        "Download Report",
-        data=st.session_state["report"],
-        file_name="industry_report.txt",
-        mime="text/plain"
-    )
+        st.markdown("## Industry Report")
+        st.markdown(report)
+        st.caption(f"Word count: {word_count(report)} / 500")
