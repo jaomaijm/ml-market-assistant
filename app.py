@@ -1,4 +1,5 @@
 import re
+import time
 import streamlit as st
 from langchain_community.retrievers import WikipediaRetriever
 from langchain_openai import ChatOpenAI
@@ -25,26 +26,33 @@ defaults = {
     "need_questions": "",
     "download_ready": False,
     "download_preparing": False,
-    "need_attempts": 0,               # NEW: count how many times we needed clarification
-    "suggested_keywords": [],         # NEW: keywords suggested by LLM
-    "forced_keywords": "",            # NEW: the chosen/entered keywords (string)
+
+    # NEW: keyword force flow persistence
+    "clarify_round": 0,          # counts how many times we asked for more context
+    "suggested_keywords": [],    # keyword suggestions from LLM
+    "forced_keywords": "",       # user-selected + typed keywords joined
+    "forced_query": "",          # final query used for forced retrieval
+    "forced_mode": False,        # True if forced retrieval was used
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # -----------------------------
-# Sidebar: API key + (single-option) LLM dropdown + reset
+# Sidebar: API key + LLM selection + reset
 # -----------------------------
 st.sidebar.header("API Key & LLM")
 
 with st.sidebar.form("api_form", clear_on_submit=False):
     api_key = st.text_input("OpenAI API key", type="password", placeholder="sk-...")
+
+    # final version = 1 option only
     llm_option = st.selectbox(
         "Select LLM",
-        options=["gpt-4.1-mini"],  # final version: only one option
+        options=["gpt-4.1-mini"],
         index=0
     )
+
     api_submitted = st.form_submit_button("Use this key", use_container_width=True)
 
 st.sidebar.caption("Your API key is used only for this session to run the app and is not stored")
@@ -66,8 +74,7 @@ if not api_key_session:
     st.info("Enter your OpenAI API key in the sidebar and click “Use this key” to begin")
     st.stop()
 
-# LLM
-MODEL_NAME = llm_option
+MODEL_NAME = "gpt-4.1-mini"
 llm = ChatOpenAI(model=MODEL_NAME, openai_api_key=api_key_session, temperature=0.2)
 
 TOP_K = 5
@@ -99,18 +106,7 @@ def retrieve_wikipedia_docs(query: str):
     retriever = WikipediaRetriever(top_k_results=TOP_K, lang=LANG)
     return retriever.invoke(query)
 
-def build_query(industry: str, details: str) -> str:
-    d = (details or "").strip()
-    if not d:
-        return industry.strip()
-    return f"{industry.strip()} ({d})"
-
 def enforce_under_500_words(text: str, limit: int = 500, max_rounds: int = 3) -> str:
-    """
-    Guarantees final text <= limit words.
-    1) Ask the model to compress (up to max_rounds)
-    2) If still too long, hard-trim tokens (last resort)
-    """
     current = (text or "").strip()
 
     for _ in range(max_rounds):
@@ -132,7 +128,7 @@ Report:
 
         current = llm.invoke(compress_prompt).content.strip()
 
-    # last resort: hard trim by whitespace tokens
+    # hard trim (final safety)
     tokens = current.split()
     return " ".join(tokens[:limit])
 
@@ -165,36 +161,56 @@ Output rules:
         return {"status": "ok"}
     return {"status": "need_details", "questions": verdict}
 
-def suggest_keywords(industry: str) -> list[str]:
-    """
-    NEW: on 2nd failure, propose specific keywords to force a Wikipedia retrieval.
-    """
-    kw_prompt = f"""
-You help users refine a Wikipedia search query.
+def build_query(industry: str, details: str) -> str:
+    d = (details or "").strip()
+    if not d:
+        return industry.strip()
+    return f"{industry.strip()} ({d})"
 
-User industry input:
-{industry}
+def should_ask_for_more_context(docs) -> bool:
+    if not docs or len(docs) < 3:
+        return True
+    joined = "\n\n".join([getattr(d, "page_content", "") for d in docs if getattr(d, "page_content", "")])
+    return len(joined.strip()) < 1200
 
-Output 8–12 concise keywords/phrases (1–4 words each) that are likely to return relevant Wikipedia pages.
+def suggest_keywords(industry: str, details: str) -> list:
+    prompt = f"""
+You help refine a Wikipedia search query.
+
+Industry: {industry}
+User details (if any): {details}
+
+Return 8–12 short keyword phrases that would improve Wikipedia retrieval.
 Rules:
-- Output ONLY a bullet list
-- No explanations
-- Keywords should narrow scope (segment, geography, value chain, market terms, regulation, technology, key product categories)
+- keywords only, one per line
+- no numbering, no punctuation
+- keep each under 5 words
 """.strip()
-
-    raw = llm.invoke(kw_prompt).content.strip()
-    # parse bullets -> list
-    lines = [re.sub(r"^[-•\s]+", "", ln).strip() for ln in raw.splitlines()]
-    lines = [ln for ln in lines if ln and len(ln) <= 40]
+    out = llm.invoke(prompt).content.strip()
+    kws = [line.strip() for line in out.split("\n") if line.strip()]
     # de-dup while preserving order
     seen = set()
+    uniq = []
+    for k in kws:
+        kl = k.lower()
+        if kl not in seen:
+            seen.add(kl)
+            uniq.append(k)
+    return uniq[:12]
+
+def merge_keywords(picked: list, typed: str) -> list:
+    typed_list = []
+    if typed and typed.strip():
+        typed_list = [x.strip() for x in typed.split(",") if x.strip()]
+    # preserve order, de-dup
     out = []
-    for ln in lines:
-        key = ln.lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(ln)
-    return out[:12]
+    seen = set()
+    for x in (picked or []) + typed_list:
+        xl = x.lower()
+        if xl not in seen:
+            seen.add(xl)
+            out.append(x)
+    return out
 
 # -----------------------------
 # Main UI
@@ -216,16 +232,12 @@ with b2:
     clear_clicked = st.button("Clear results", use_container_width=True)
 
 if clear_clicked:
-    for k in ["stage", "details", "docs", "report", "need_questions",
-              "download_ready", "download_preparing", "need_attempts",
-              "suggested_keywords", "forced_keywords"]:
+    for k in ["stage", "details", "docs", "report", "need_questions", "download_ready", "download_preparing",
+              "clarify_round", "suggested_keywords", "forced_keywords", "forced_query", "forced_mode"]:
         st.session_state[k] = defaults[k]
     st.session_state["industry"] = industry_input.strip()
     st.rerun()
 
-# -----------------------------
-# Search flow
-# -----------------------------
 if search_clicked:
     if not looks_like_input(industry_input):
         st.warning("Please enter an industry to continue")
@@ -238,9 +250,11 @@ if search_clicked:
     st.session_state["need_questions"] = ""
     st.session_state["download_ready"] = False
     st.session_state["download_preparing"] = False
-    st.session_state["need_attempts"] = 0
-    st.session_state["suggested_keywords"] = []
+    st.session_state["forced_mode"] = False
     st.session_state["forced_keywords"] = ""
+    st.session_state["forced_query"] = ""
+    st.session_state["suggested_keywords"] = []
+    st.session_state["clarify_round"] = 0
     st.session_state["stage"] = "start"
 
     with st.spinner("Retrieving Wikipedia pages..."):
@@ -248,7 +262,7 @@ if search_clicked:
 
     if not docs:
         st.session_state["stage"] = "need_details"
-        st.session_state["need_attempts"] = 1
+        st.session_state["clarify_round"] = 1
         st.rerun()
 
     with st.spinner("Checking relevance..."):
@@ -258,7 +272,7 @@ if search_clicked:
         st.session_state["stage"] = "need_details"
         st.session_state["docs"] = docs
         st.session_state["need_questions"] = check["questions"]
-        st.session_state["need_attempts"] = 1
+        st.session_state["clarify_round"] = 1
         st.rerun()
 
     st.session_state["docs"] = docs
@@ -266,7 +280,7 @@ if search_clicked:
     st.rerun()
 
 # -----------------------------
-# Need details flow (1st time)
+# Need details flow (1st loop)
 # -----------------------------
 if st.session_state["stage"] == "need_details":
     st.subheader("I need a bit more detail to avoid pulling the wrong pages")
@@ -299,8 +313,11 @@ if st.session_state["stage"] == "need_details":
             docs = retrieve_wikipedia_docs(build_query(st.session_state["industry"], st.session_state["details"]))
 
         if not docs:
-            # 2nd failure -> keyword forcing
-            st.session_state["need_attempts"] = 2
+            # 2nd failure -> go to keyword_force
+            st.session_state["clarify_round"] = 2
+            st.session_state["suggested_keywords"] = suggest_keywords(
+                st.session_state["industry"], st.session_state["details"]
+            )
             st.session_state["stage"] = "keyword_force"
             st.rerun()
 
@@ -308,10 +325,13 @@ if st.session_state["stage"] == "need_details":
             check = assess_relevance(f"{st.session_state['industry']} ({st.session_state['details']})", docs)
 
         if check["status"] == "need_details":
-            # 2nd failure -> keyword forcing
+            # 2nd failure -> go to keyword_force
             st.session_state["docs"] = docs
             st.session_state["need_questions"] = check["questions"]
-            st.session_state["need_attempts"] = 2
+            st.session_state["clarify_round"] = 2
+            st.session_state["suggested_keywords"] = suggest_keywords(
+                st.session_state["industry"], st.session_state["details"]
+            )
             st.session_state["stage"] = "keyword_force"
             st.rerun()
 
@@ -327,32 +347,36 @@ if st.session_state["stage"] == "need_details":
         st.rerun()
 
 # -----------------------------
-# NEW: Keyword forcing flow (2nd time)
+# Keyword force flow (2nd loop)
+# - user can click keywords AND type extra ones
+# - keeps the summary visible later
 # -----------------------------
 if st.session_state["stage"] == "keyword_force":
-    st.subheader("Still unclear — choose keywords to force a precise search")
+    st.subheader("I still can't confidently identify the right pages")
+    st.info("Pick some keywords (click) and/or type extra ones to force Wikipedia retrieval")
 
-    # show the latest questions so user understands why
-    if st.session_state["need_questions"]:
-        st.info(st.session_state["need_questions"])
+    suggested = st.session_state.get("suggested_keywords", [])
+    default_picks = suggested[:4] if suggested else []
 
-    # generate keyword suggestions once
-    if not st.session_state["suggested_keywords"]:
-        with st.spinner("Generating keyword suggestions..."):
-            st.session_state["suggested_keywords"] = suggest_keywords(st.session_state["industry"])
+    # clickable (pills) + fallback
+    try:
+        picked = st.pills(
+            "Click to select keywords",
+            options=suggested,
+            default=default_picks,
+            selection_mode="multi",
+        )
+    except Exception:
+        picked = st.multiselect(
+            "Suggested keywords (select)",
+            options=suggested,
+            default=default_picks,
+        )
 
-    st.caption("Pick a few keywords (or type your own). Then I will force-retrieve 5 Wikipedia pages.")
-
-    picked = st.multiselect(
-        "Suggested keywords",
-        options=st.session_state["suggested_keywords"],
-        default=st.session_state["suggested_keywords"][:4] if st.session_state["suggested_keywords"] else [],
-    )
-
-    custom = st.text_input(
-        "Add custom keywords (comma-separated)",
-        value=st.session_state["forced_keywords"],
-        placeholder="Example: Vietnam, pet food, premiumization, supply chain",
+    typed = st.text_input(
+        "Optional: add your own keywords (comma-separated)",
+        value="",
+        placeholder="Example: B2C, premiumization, supply chain, regulation",
     )
 
     k1, k2 = st.columns(2)
@@ -366,35 +390,45 @@ if st.session_state["stage"] == "keyword_force":
         st.rerun()
 
     if force_search:
-        custom_list = [x.strip() for x in (custom or "").split(",") if x.strip()]
-        all_keywords = [*picked, *custom_list]
-        all_keywords = [k for k in all_keywords if k]
-
-        if not all_keywords:
-            st.warning("Please select or enter at least 1 keyword")
+        all_keywords = merge_keywords(picked, typed)
+        if len(all_keywords) == 0:
+            st.warning("Please select at least 1 keyword or type one")
             st.stop()
 
         st.session_state["forced_keywords"] = ", ".join(all_keywords)
-
         forced_query = f"{st.session_state['industry']} " + " ".join(all_keywords)
+        st.session_state["forced_query"] = forced_query
+        st.session_state["forced_mode"] = True
 
         with st.spinner("Forcing Wikipedia retrieval..."):
             docs = retrieve_wikipedia_docs(forced_query)
 
         if not docs:
-            st.error("Still couldn't retrieve pages. Try different keywords (more specific terms).")
+            st.error("Still couldn't retrieve pages. Try more specific keywords.")
             st.stop()
 
-        # IMPORTANT: We force-ready (skip relevance loop) to guarantee 5 URLs display
         st.session_state["docs"] = docs
         st.session_state["stage"] = "ready"
         st.rerun()
 
 # -----------------------------
-# Step 2 display (title + full URL)
+# Step 2 display (pages)
 # -----------------------------
 if st.session_state["stage"] in ["ready", "reported"] and st.session_state["docs"]:
     st.subheader("Step 2: Wikipedia pages (5)")
+
+    if st.session_state.get("forced_mode"):
+        st.info(
+            f"Forced search was used\n\n"
+            f"Industry: **{st.session_state['industry']}**\n\n"
+            f"Keywords: **{st.session_state.get('forced_keywords','')}**"
+        )
+        if st.session_state.get("forced_query"):
+            st.caption(f"Query used: {st.session_state['forced_query']}")
+
+        if st.button("Edit forced keywords", use_container_width=True):
+            st.session_state["stage"] = "keyword_force"
+            st.rerun()
 
     for i, d in enumerate(st.session_state["docs"][:TOP_K], start=1):
         title = extract_title(d)
@@ -484,21 +518,14 @@ Wikipedia context:
         with st.spinner("Generating report..."):
             output = llm.invoke(prompt).content.strip()
 
-        # if model responds with questions, push user back (first time flow only)
         if output.count("?") >= 2 and word_count(output) < 220:
-            # if they already tried once -> go keyword forcing directly
-            if st.session_state.get("need_attempts", 0) >= 1:
-                st.session_state["stage"] = "keyword_force"
-                st.session_state["need_questions"] = output
-                st.session_state["need_attempts"] = 2
-            else:
-                st.session_state["stage"] = "need_details"
-                st.session_state["need_questions"] = output
-                st.session_state["need_attempts"] = 1
-
+            st.session_state["stage"] = "need_details"
+            st.session_state["need_questions"] = output
             st.session_state["report"] = ""
             st.session_state["download_ready"] = False
             st.session_state["download_preparing"] = False
+            # we don't automatically jump to keyword_force here
+            # because this is report-generation ambiguity, not retrieval ambiguity
             st.rerun()
 
         report = enforce_under_500_words(output)
