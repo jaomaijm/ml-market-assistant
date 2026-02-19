@@ -22,18 +22,22 @@ defaults = {
     "clarification_1": "",
     "clarification_2": "",
     "docs": [],
-    "ranked_docs": [],            # list of dicts: {score, doc, title, url}
-    "confidence_mode": "unknown", # "confident" | "needs_help"
-    "clarify_round": 0,           # 0 -> none, 1 -> asked once, 2 -> asked twice
-    "context_ideas": [],          # clickable ideas to help user clarify
-    "force_keywords": [],         # clickable chips for forcing
-    "force_keyword_selected": "", # what user clicked
-    "force_keyword_text": "",     # manual typed
-    "query_used": "",             # final query for retrieval
+    "ranked_docs": [],
+
+    "confidence_mode": "unknown",
+    "clarify_round": 0,
+
+    "context_ideas": [],
+    "force_keywords": [],
+    "force_keyword_selected": "",
+    "force_keyword_text": "",
+
+    "query_used": "",
+    "topic_for_report": "",        # NEW: always reflect the latest refined user intent
     "report": "",
-    # NEW: banner (so we can show a bar after context attempt fails)
+
     "banner_text": "",
-    "banner_kind": "",            # "info" | "warning" | "error" | "success"
+    "banner_kind": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -65,9 +69,9 @@ llm = ChatOpenAI(model=model_choice, temperature=0.2, openai_api_key=api_key)
 # CONSTANTS
 # ==========================================================
 LANG = "en"
-RETRIEVE_TOP_K = 10          # retrieve more than 5, then rank
-STRONG_THRESHOLD = 70        # "highly relevant" threshold
-MIN_STRONG_FOR_AUTO = 5      # used only when system is confident BEFORE round-2 requirement
+RETRIEVE_TOP_K = 10
+STRONG_THRESHOLD = 70
+MIN_STRONG_FOR_AUTO = 5
 
 # ==========================================================
 # HELPERS
@@ -144,8 +148,6 @@ Industry term:
 {industry}
 
 Return ONLY as a comma-separated list.
-Example:
-UK B2C, Thailand B2B, Skincare only, EV charging, Premium segment, Regulations focus
 """
     resp = llm.invoke(prompt).content
     ideas = [x.strip() for x in resp.split(",") if x.strip()]
@@ -166,7 +168,7 @@ Clarification 2:
 
 Rules:
 - Keywords must be short (2-5 words)
-- Should be Wikipedia-search friendly
+- Wikipedia-search friendly
 - Avoid duplicates
 Return ONLY as comma-separated list.
 """
@@ -184,11 +186,30 @@ def build_query(industry: str, c1: str = "", c2: str = "", forced_kw: str = "") 
         parts.append(forced_kw.strip())
     return " ".join(parts).strip()
 
-def generate_report(industry: str, docs_for_report):
+def compute_topic_for_report(industry: str, c1: str, c2: str, forced_kw: str) -> str:
+    """
+    NEW: Make the report topic reflect the latest refined user intent.
+    Example:
+    industry="pet", forced_kw="pet companionship" -> "pet — pet companionship"
+    """
+    bits = [industry.strip()]
+    # prefer "forced" as the strongest signal of user intent if present
+    if forced_kw.strip():
+        bits.append(f"focus: {forced_kw.strip()}")
+    if c1.strip():
+        bits.append(f"context: {c1.strip()}")
+    if c2.strip():
+        bits.append(f"more context: {c2.strip()}")
+    return " | ".join(bits).strip()
+
+def generate_report(topic_for_report: str, docs_for_report):
     context = "\n\n".join([(d.page_content or "")[:2000] for d in docs_for_report]).strip()
 
     prompt = f"""
 You are a professional market research analyst writing a clean, readable Markdown brief.
+
+Topic (follow this intent exactly):
+{topic_for_report}
 
 Hard rules:
 - Use ONLY the context below
@@ -200,7 +221,7 @@ Hard rules:
 
 Output format (follow exactly):
 
-## Industry Brief: {industry}
+## Industry Brief: <clean industry name based on topic above>
 
 ### Scope
 Write 1–2 sentences as a normal paragraph.
@@ -239,6 +260,7 @@ def show_ranked_urls_section(ranked):
 
     st.subheader("Step 2: Top Wikipedia Pages (Ranked)")
     st.caption(f"Query used: {st.session_state.query_used}")
+    st.caption(f"Report topic: {st.session_state.topic_for_report}")
 
     if strong_count >= 5:
         st.success("Found strong matches (based on relevance scoring)")
@@ -257,14 +279,13 @@ def show_ranked_urls_section(ranked):
     )
 
 def render_step_tracker():
-    # NEW: show all steps as user goes through (always visible)
     stage = st.session_state.stage
     done1 = bool(st.session_state.industry.strip())
     done2 = bool(st.session_state.ranked_docs)
     done3 = bool(st.session_state.report)
 
     current = 1
-    if stage in ["clarify_1", "clarify_2", "force_keywords", "step2_results"]:
+    if stage in ["clarify_1", "clarify_2", "force_keywords", "step2_results", "reported"]:
         current = 2
     if stage == "reported":
         current = 3
@@ -287,7 +308,6 @@ def render_step_tracker():
     st.divider()
 
 def show_banner_if_any():
-    # NEW: show "bar" messages (once) without breaking flow
     if st.session_state.banner_text:
         kind = st.session_state.banner_kind or "info"
         msg = st.session_state.banner_text
@@ -301,7 +321,6 @@ def show_banner_if_any():
         else:
             st.info(msg)
 
-        # clear after showing once
         st.session_state.banner_text = ""
         st.session_state.banner_kind = ""
 
@@ -316,20 +335,16 @@ def run_retrieval_and_ranking(query: str, force_show_results: bool = False):
     st.session_state.ranked_docs = ranked
     st.session_state.query_used = query
 
-    # If after round 2, ALWAYS show ranked URLs even if weak/no match
     if force_show_results or st.session_state.clarify_round >= 2:
         st.session_state.confidence_mode = "needs_help"
         st.session_state.stage = "step2_results"
         st.rerun()
 
-    # Otherwise follow the normal flow
     if is_confident(ranked):
         st.session_state.confidence_mode = "confident"
         st.session_state.stage = "step2_results"
     else:
         st.session_state.confidence_mode = "needs_help"
-
-        # NEW: if user already provided context once and still weak -> show a bar + clickable keywords next
         if st.session_state.clarify_round == 1:
             st.session_state.banner_text = "Couldn’t find strong matches even after your clarification. Try one of the clickable keywords below to guide the search"
             st.session_state.banner_kind = "warning"
@@ -348,100 +363,147 @@ render_step_tracker()
 show_banner_if_any()
 
 # ==========================================================
-# STEP 1 — USER INPUT
+# UX: KEEP COMPLETED STEPS VISIBLE
+# - Step 1 summary stays visible after user proceeds
+# - Step 2 clarification summaries stay visible too
 # ==========================================================
-st.subheader("Step 1: Input")
-industry_input = st.text_input(
-    "Input the industry that you want to do market research",
-    value=st.session_state.industry,
-    placeholder="Example: pet food market, electric vehicles, cosmetics in Vietnam",
-)
-
-c1, c2 = st.columns(2)
-with c1:
-    start_btn = st.button("Find relevant Wikipedia pages", type="primary", use_container_width=True)
-with c2:
-    clear_btn = st.button("Clear", use_container_width=True)
-
-if clear_btn:
-    for k in defaults:
-        st.session_state[k] = defaults[k]
-    st.rerun()
-
-if start_btn:
-    if not industry_input.strip():
-        st.warning("Please enter an industry")
-        st.stop()
-
-    st.session_state.industry = industry_input.strip()
-    st.session_state.clarify_round = 0
-    st.session_state.context_ideas = suggest_context_ideas(st.session_state.industry)
-
-    query = build_query(st.session_state.industry)
-    run_retrieval_and_ranking(query)
-
-# ==========================================================
-# STEP 2 PATH 2.1 — CLARIFICATION ROUND 1
-# ==========================================================
-if st.session_state.stage == "clarify_1":
-    st.subheader("Step 2: Clarification Needed (Round 1)")
-    st.warning("I’m not confident I can pull the right pages yet. Add more detail so I don’t retrieve the wrong URLs")
-
-    if st.session_state.context_ideas:
-        st.markdown("Pick a context idea (optional)")
-        cols = st.columns(len(st.session_state.context_ideas))
-        for i, idea in enumerate(st.session_state.context_ideas):
-            if cols[i].button(idea, use_container_width=True, key=f"idea1_{i}"):
-                st.session_state.clarification_1 = (
-                    f"{st.session_state.clarification_1}, {idea}".strip(", ")
-                    if st.session_state.clarification_1 else idea
-                )
-                st.rerun()
-
-    st.session_state.clarification_1 = st.text_input(
-        "Add context (country, segment, B2B/B2C, product category, customer type)",
-        value=st.session_state.clarification_1,
-        placeholder="Example: UK, premium segment, B2C",
+with st.expander("Step 1: Input (always visible)", expanded=True):
+    st.subheader("Step 1: Input")
+    industry_input = st.text_input(
+        "Input the industry that you want to do market research",
+        value=st.session_state.industry,
+        placeholder="Example: pet market, electric vehicles, cosmetics in Vietnam",
+        key="industry_input_main",
     )
 
-    if st.button("Retry with clarification", type="primary"):
-        st.session_state.clarify_round = 1
-        query = build_query(st.session_state.industry, st.session_state.clarification_1)
+    c1, c2 = st.columns(2)
+    with c1:
+        start_btn = st.button("Find relevant Wikipedia pages", type="primary", use_container_width=True, key="start_btn")
+    with c2:
+        clear_btn = st.button("Clear", use_container_width=True, key="clear_btn")
+
+    if clear_btn:
+        for k in defaults:
+            st.session_state[k] = defaults[k]
+        st.rerun()
+
+    if start_btn:
+        if not industry_input.strip():
+            st.warning("Please enter an industry")
+            st.stop()
+
+        st.session_state.industry = industry_input.strip()
+        st.session_state.clarify_round = 0
+        st.session_state.report = ""
+        st.session_state.ranked_docs = []
+        st.session_state.docs = []
+
+        st.session_state.context_ideas = suggest_context_ideas(st.session_state.industry)
+
+        # NEW: reset “latest intent”
+        st.session_state.force_keyword_selected = ""
+        st.session_state.force_keyword_text = ""
+        st.session_state.topic_for_report = compute_topic_for_report(
+            st.session_state.industry,
+            st.session_state.clarification_1,
+            st.session_state.clarification_2,
+            forced_kw=""
+        )
+
+        query = build_query(st.session_state.industry)
         run_retrieval_and_ranking(query)
 
 # ==========================================================
-# STEP 2 PATH 2.2 — CLARIFICATION ROUND 2
+# STEP 2 PATH 2.1 — CLARIFICATION ROUND 1 (ALWAYS VISIBLE)
 # ==========================================================
-if st.session_state.stage == "clarify_2":
-    st.subheader("Step 2: Clarification Needed (Round 2)")
-    st.warning("Still not confident. Add one more layer of detail. After this, I will show best-available ranked pages even if matches are weak")
+with st.expander("Step 2: Clarification (always visible when needed)", expanded=(st.session_state.stage in ["clarify_1", "clarify_2", "force_keywords"])):
+    if st.session_state.stage == "clarify_1":
+        st.subheader("Step 2: Clarification Needed (Round 1)")
+        st.warning("I’m not confident I can pull the right pages yet. Add more detail so I don’t retrieve the wrong URLs")
 
-    if not st.session_state.context_ideas:
-        st.session_state.context_ideas = suggest_context_ideas(st.session_state.industry)
+        if st.session_state.context_ideas:
+            st.markdown("Pick a context idea (optional)")
+            cols = st.columns(len(st.session_state.context_ideas))
+            for i, idea in enumerate(st.session_state.context_ideas):
+                if cols[i].button(idea, use_container_width=True, key=f"idea1_{i}"):
+                    st.session_state.clarification_1 = (
+                        f"{st.session_state.clarification_1}, {idea}".strip(", ")
+                        if st.session_state.clarification_1 else idea
+                    )
+                    # NEW: update topic intent immediately
+                    st.session_state.topic_for_report = compute_topic_for_report(
+                        st.session_state.industry,
+                        st.session_state.clarification_1,
+                        st.session_state.clarification_2,
+                        st.session_state.force_keyword_selected
+                    )
+                    st.rerun()
 
-    # NEW: when user provided context but system still can’t find, show clickable keywords (in the same screen)
-    st.markdown("If you're stuck, click a suggestion to help you think")
-    ideas = st.session_state.context_ideas[:6]
-    if ideas:
-        cols = st.columns(len(ideas))
-        for i, idea in enumerate(ideas):
-            if cols[i].button(idea, use_container_width=True, key=f"idea2_{i}"):
-                st.session_state.clarification_2 = (
-                    f"{st.session_state.clarification_2}, {idea}".strip(", ")
-                    if st.session_state.clarification_2 else idea
-                )
-                st.rerun()
+        st.session_state.clarification_1 = st.text_input(
+            "Add context (country, segment, B2B/B2C, product category, customer type)",
+            value=st.session_state.clarification_1,
+            placeholder="Example: UK, premium segment, B2C",
+            key="clar1_box"
+        )
 
-    st.session_state.clarification_2 = st.text_input(
-        "Add more context (regulation focus, geography, customer segment, subcategory)",
-        value=st.session_state.clarification_2,
-        placeholder="Example: franchise segment, consumer behaviour, supply chain focus",
-    )
+        if st.button("Retry with clarification", type="primary", key="retry_clar1"):
+            st.session_state.clarify_round = 1
 
-    if st.button("Retry again", type="primary"):
-        st.session_state.clarify_round = 2
-        query = build_query(st.session_state.industry, st.session_state.clarification_1, st.session_state.clarification_2)
-        run_retrieval_and_ranking(query, force_show_results=True)
+            # NEW: update topic intent before retrieval
+            st.session_state.topic_for_report = compute_topic_for_report(
+                st.session_state.industry,
+                st.session_state.clarification_1,
+                st.session_state.clarification_2,
+                st.session_state.force_keyword_selected
+            )
+
+            query = build_query(st.session_state.industry, st.session_state.clarification_1)
+            run_retrieval_and_ranking(query)
+
+    if st.session_state.stage == "clarify_2":
+        st.subheader("Step 2: Clarification Needed (Round 2)")
+        st.warning("Still not confident. Add one more layer of detail. After this, I will show best-available ranked pages even if matches are weak")
+
+        if not st.session_state.context_ideas:
+            st.session_state.context_ideas = suggest_context_ideas(st.session_state.industry)
+
+        st.markdown("If you're stuck, click a suggestion to help you think")
+        ideas = st.session_state.context_ideas[:6]
+        if ideas:
+            cols = st.columns(len(ideas))
+            for i, idea in enumerate(ideas):
+                if cols[i].button(idea, use_container_width=True, key=f"idea2_{i}"):
+                    st.session_state.clarification_2 = (
+                        f"{st.session_state.clarification_2}, {idea}".strip(", ")
+                        if st.session_state.clarification_2 else idea
+                    )
+                    st.session_state.topic_for_report = compute_topic_for_report(
+                        st.session_state.industry,
+                        st.session_state.clarification_1,
+                        st.session_state.clarification_2,
+                        st.session_state.force_keyword_selected
+                    )
+                    st.rerun()
+
+        st.session_state.clarification_2 = st.text_input(
+            "Add more context (regulation focus, geography, customer segment, subcategory)",
+            value=st.session_state.clarification_2,
+            placeholder="Example: companionship animals, retail segment, supply chain focus",
+            key="clar2_box"
+        )
+
+        if st.button("Retry again", type="primary", key="retry_clar2"):
+            st.session_state.clarify_round = 2
+
+            st.session_state.topic_for_report = compute_topic_for_report(
+                st.session_state.industry,
+                st.session_state.clarification_1,
+                st.session_state.clarification_2,
+                st.session_state.force_keyword_selected
+            )
+
+            query = build_query(st.session_state.industry, st.session_state.clarification_1, st.session_state.clarification_2)
+            run_retrieval_and_ranking(query, force_show_results=True)
 
 # ==========================================================
 # STEP 2 PATH 2.3 — FORCE KEYWORDS (CLICK OR TYPE)
@@ -463,6 +525,15 @@ def render_force_keyword_panel():
             col = cols[idx % 4]
             if col.button(kw, use_container_width=True, key=f"kwchip_{idx}"):
                 st.session_state.force_keyword_selected = kw
+
+                # NEW: topic intent updates to the most recent refined choice (this is what you asked)
+                st.session_state.topic_for_report = compute_topic_for_report(
+                    st.session_state.industry,
+                    st.session_state.clarification_1,
+                    st.session_state.clarification_2,
+                    forced_kw=kw
+                )
+
                 query = build_query(
                     st.session_state.industry,
                     st.session_state.clarification_1,
@@ -474,15 +545,25 @@ def render_force_keyword_panel():
     st.session_state.force_keyword_text = st.text_input(
         "Or type a forcing keyword",
         value=st.session_state.force_keyword_text,
-        placeholder="Example: retail, regulation, supply chain, consumer behaviour",
+        placeholder="Example: pet companionship, retail, regulation, consumer behaviour",
+        key="force_kw_text"
     )
 
-    if st.button("Run forced search", type="primary"):
+    if st.button("Run forced search", type="primary", key="run_forced_btn"):
         kw = st.session_state.force_keyword_text.strip()
         if not kw:
             st.warning("Type a keyword or click a chip")
             st.stop()
         st.session_state.force_keyword_selected = kw
+
+        # NEW: topic intent becomes the most recent user-provided forcing keyword
+        st.session_state.topic_for_report = compute_topic_for_report(
+            st.session_state.industry,
+            st.session_state.clarification_1,
+            st.session_state.clarification_2,
+            forced_kw=kw
+        )
+
         query = build_query(
             st.session_state.industry,
             st.session_state.clarification_1,
@@ -491,103 +572,112 @@ def render_force_keyword_panel():
         )
         run_retrieval_and_ranking(query, force_show_results=True)
 
-if st.session_state.stage == "force_keywords":
-    st.subheader("Step 2: Forced Search (System still unsure)")
-    st.warning("Even after clarification, the request is still ambiguous for Wikipedia. Choose a forcing keyword to guide retrieval")
+with st.expander("Step 2: Forced keywords (always visible when needed)", expanded=(st.session_state.stage in ["force_keywords", "step2_results"] and st.session_state.confidence_mode == "needs_help")):
+    if st.session_state.stage == "force_keywords":
+        st.subheader("Step 2: Forced Search (System still unsure)")
+        st.warning("Even after clarification, the request is still ambiguous for Wikipedia. Choose a forcing keyword to guide retrieval")
     render_force_keyword_panel()
+    if st.session_state.force_keyword_selected:
+        st.info(f"Forced keyword chosen: {st.session_state.force_keyword_selected}")
+    if st.session_state.topic_for_report:
+        st.caption(f"Current report topic: {st.session_state.topic_for_report}")
 
 # ==========================================================
-# STEP 2 RESULTS — SHOW URLS + SCORES
+# STEP 2 RESULTS — SHOW URLS + SCORES (ALWAYS VISIBLE)
 # ==========================================================
-if st.session_state.stage == "step2_results":
-    ranked = st.session_state.ranked_docs or []
-    if not ranked:
-        st.error("No results to show. Please try again")
-        st.stop()
+with st.expander("Step 2: Ranked URLs (always visible after retrieval)", expanded=bool(st.session_state.ranked_docs)):
+    if st.session_state.ranked_docs:
+        ranked = st.session_state.ranked_docs
+        show_ranked_urls_section(ranked)
 
-    with st.expander("Refine search (optional)", expanded=(st.session_state.confidence_mode == "needs_help")):
-        render_force_keyword_panel()
-        if st.session_state.force_keyword_selected:
-            st.info(f"Forced keyword used: {st.session_state.force_keyword_selected}")
+        top5 = ranked[:5]
+        strong_in_top5 = [x for x in top5 if x["score"] >= STRONG_THRESHOLD]
+        backup_in_top5 = [x for x in top5 if x["score"] < STRONG_THRESHOLD]
 
-    show_ranked_urls_section(ranked)
+        st.markdown("#### Ranked results (top 5)")
+        if strong_in_top5:
+            st.markdown("**Strong matches**")
+            for i, x in enumerate(strong_in_top5, 1):
+                st.markdown(f"**{i}. {x['title']}**")
+                st.caption(f"Relevance: {x['score']}/100")
+                st.markdown(x["url"] if x["url"] else "_No URL available_")
+                st.markdown("")
 
-    top5 = ranked[:5]
-    strong_in_top5 = [x for x in top5 if x["score"] >= STRONG_THRESHOLD]
-    backup_in_top5 = [x for x in top5 if x["score"] < STRONG_THRESHOLD]
+        if backup_in_top5:
+            st.markdown("**Backup matches (less direct)**")
+            for i, x in enumerate(backup_in_top5, 1):
+                st.markdown(f"**{i}. {x['title']}**")
+                st.caption(f"Relevance: {x['score']}/100")
+                st.markdown(x["url"] if x["url"] else "_No URL available_")
+                st.markdown("")
 
-    st.markdown("---")
-    st.markdown("#### Ranked results (top 5)")
+    else:
+        st.caption("No ranked URLs yet. Complete Step 1 to retrieve Wikipedia pages")
 
-    if strong_in_top5:
-        st.markdown("**Strong matches**")
-        for i, x in enumerate(strong_in_top5, 1):
-            st.markdown(f"**{i}. {x['title']}**")
-            st.caption(f"Relevance: {x['score']}/100")
-            st.markdown(x["url"] if x["url"] else "_No URL available_")
-            st.markdown("")
+# ==========================================================
+# STEP 3 — REPORT (ALWAYS VISIBLE AFTER URLS EXIST)
+# ==========================================================
+with st.expander("Step 3: Report (always visible after Step 2)", expanded=(st.session_state.stage in ["step2_results", "reported"] and bool(st.session_state.ranked_docs))):
+    if not st.session_state.ranked_docs:
+        st.caption("Report generation will appear here after Step 2 retrieves ranked URLs")
+    else:
+        st.subheader("Step 3: Report")
+        st.caption(f"Report topic used: {st.session_state.topic_for_report or st.session_state.industry}")
 
-    if backup_in_top5:
-        st.markdown("**Backup matches (less direct)**")
-        for i, x in enumerate(backup_in_top5, 1):
-            st.markdown(f"**{i}. {x['title']}**")
-            st.caption(f"Relevance: {x['score']}/100")
-            st.markdown(x["url"] if x["url"] else "_No URL available_")
-            st.markdown("")
+        ranked = st.session_state.ranked_docs
+        top5 = ranked[:5]
 
-    # ======================================================
-    # STEP 3 — REPORT
-    # ======================================================
-    st.subheader("Step 3: Report")
+        require_selection = (st.session_state.clarify_round >= 2)
 
-    require_selection = (st.session_state.clarify_round >= 2)
+        if not require_selection:
+            strong_all = [x for x in ranked if x["score"] >= STRONG_THRESHOLD]
+            auto_ok = len(strong_all) >= MIN_STRONG_FOR_AUTO
 
-    if not require_selection:
-        strong_all = [x for x in ranked if x["score"] >= STRONG_THRESHOLD]
-        auto_ok = len(strong_all) >= MIN_STRONG_FOR_AUTO
+            if auto_ok:
+                st.success("5 strong matches found, no need to select pages")
+                if st.button("Generate report", type="primary", key="gen_report_auto"):
+                    docs_for_report = [x["doc"] for x in ranked[:5]]
+                    topic = st.session_state.topic_for_report or st.session_state.industry
+                    st.session_state.report = generate_report(topic, docs_for_report)
+                    st.session_state.stage = "reported"
+                    st.rerun()
+            else:
+                require_selection = True
 
-        if auto_ok:
-            st.success("5 strong matches found, no need to select pages")
-            if st.button("Generate report", type="primary"):
-                docs_for_report = [x["doc"] for x in ranked[:5]]
-                st.session_state.report = generate_report(st.session_state.industry, docs_for_report)
+        if require_selection:
+            st.info("Select which pages to use for the report (recommended: choose the highest scores first)")
+            selected_docs = []
+            for x in top5:
+                label = f"{x['title']} ({x['score']}/100)"
+                default_on = x["score"] >= STRONG_THRESHOLD
+                if st.checkbox(label, value=default_on, key=f"sel_{x['title']}_{x['score']}"):
+                    selected_docs.append(x["doc"])
+
+            if st.button("Generate report", type="primary", key="gen_report_selected"):
+                if not selected_docs:
+                    st.warning("Select at least one page")
+                    st.stop()
+                topic = st.session_state.topic_for_report or st.session_state.industry
+                st.session_state.report = generate_report(topic, selected_docs)
                 st.session_state.stage = "reported"
                 st.rerun()
-        else:
-            require_selection = True
-
-    if require_selection:
-        st.info("Select which pages to use for the report (recommended: choose the highest scores first)")
-
-        selected_docs = []
-        for x in top5:
-            label = f"{x['title']} ({x['score']}/100)"
-            default_on = x["score"] >= STRONG_THRESHOLD
-            if st.checkbox(label, value=default_on, key=f"sel_{x['title']}_{x['score']}"):
-                selected_docs.append(x["doc"])
-
-        if st.button("Generate report", type="primary"):
-            if not selected_docs:
-                st.warning("Select at least one page")
-                st.stop()
-            st.session_state.report = generate_report(st.session_state.industry, selected_docs)
-            st.session_state.stage = "reported"
-            st.rerun()
 
 # ==========================================================
-# STEP 3 OUTPUT — REPORT
+# REPORT OUTPUT (ALWAYS VISIBLE ONCE GENERATED)
 # ==========================================================
-if st.session_state.stage == "reported":
-    st.subheader("Step 3: Market Research Report")
-    st.markdown(st.session_state.report)
+with st.expander("Output: Market Research Report (always visible once generated)", expanded=bool(st.session_state.report)):
+    if st.session_state.report:
+        st.markdown(st.session_state.report)
+        wc = word_count(st.session_state.report)
+        st.caption(f"Word count: {wc} / 500")
 
-    wc = word_count(st.session_state.report)
-    st.caption(f"Word count: {wc} / 500")
-
-    st.download_button(
-        "Download report (TXT)",
-        data=st.session_state.report,
-        file_name="industry_report.txt",
-        mime="text/plain",
-        use_container_width=True,
-    )
+        st.download_button(
+            "Download report (TXT)",
+            data=st.session_state.report,
+            file_name="industry_report.txt",
+            mime="text/plain",
+            use_container_width=True,
+            key="download_report_txt",
+        )
+    else:
+        st.caption("No report yet. Complete Step 3 to generate the report")
