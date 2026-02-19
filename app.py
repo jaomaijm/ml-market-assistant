@@ -8,29 +8,31 @@ from langchain_openai import ChatOpenAI
 # -----------------------------
 st.set_page_config(page_title="Market Research Assistant", page_icon="📊", layout="wide")
 st.title("📊 Market Research Assistant")
-st.caption("Retrieve relevant Wikipedia pages and generate a structured industry brief under 500 words.")
+st.caption("Structured industry research assistant with clarification + relevance ranking.")
 
 # -----------------------------
-# Session state
+# Session State
 # -----------------------------
 defaults = {
     "stage": "start",
     "industry": "",
+    "clarification": "",
+    "clarification_round": 0,
     "docs": None,
     "final_docs": None,
-    "report": "",
+    "report": ""
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # -----------------------------
-# Sidebar: API + LLM
+# Sidebar
 # -----------------------------
 st.sidebar.header("Configuration")
 
 with st.sidebar.form("api_form"):
-    api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+    api_key = st.text_input("OpenAI API Key", type="password")
     llm_option = st.selectbox("Select LLM", ["gpt-4.1-mini"])
     submitted = st.form_submit_button("Use Key")
 
@@ -48,23 +50,39 @@ llm = ChatOpenAI(
     temperature=0.2
 )
 
-TOP_K = 8  # retrieve more than 5 for ranking
+TOP_K = 8
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def extract_url(doc):
-    return doc.metadata.get("source", "")
-
 def extract_title(doc):
     return doc.metadata.get("title", "Wikipedia Page")
+
+def extract_url(doc):
+    return doc.metadata.get("source", "")
 
 def word_count(text):
     return len(re.findall(r"\b\w+\b", text))
 
+def enforce_under_500(text):
+    if word_count(text) <= 500:
+        return text
+    return " ".join(text.split()[:500])
+
 def retrieve_docs(query):
     retriever = WikipediaRetriever(top_k_results=TOP_K, lang="en")
     return retriever.invoke(query)
+
+def check_ambiguity(industry):
+    prompt = f"""
+User industry input:
+{industry}
+
+If this industry is too broad or ambiguous, ask 2-3 short clarifying questions.
+If clear enough for retrieval, output exactly: CLEAR
+"""
+    result = llm.invoke(prompt).content.strip()
+    return result
 
 def rank_documents(industry, docs):
     scored = []
@@ -78,7 +96,7 @@ Page title:
 {extract_title(d)}
 
 Snippet:
-{d.page_content[:1000]}
+{d.page_content[:800]}
 
 Score relevance 0-10.
 Only output number.
@@ -96,46 +114,79 @@ Only output number.
 
     return strong, weak
 
-def enforce_under_500(text):
-    if word_count(text) <= 500:
-        return text
-    tokens = text.split()
-    return " ".join(tokens[:500])
-
 # -----------------------------
 # STEP 1: Industry Input
 # -----------------------------
 st.subheader("Step 1: Enter Industry")
 
-industry = st.text_input("Industry name", placeholder="e.g. Electric Vehicles")
+industry_input = st.text_input("Industry")
 
-if st.button("Search Wikipedia", type="primary"):
-    if not industry.strip():
-        st.warning("Please enter an industry.")
+if st.button("Continue", type="primary"):
+    if not industry_input.strip():
+        st.warning("Please enter industry.")
         st.stop()
 
-    st.session_state["industry"] = industry
-    with st.spinner("Retrieving pages..."):
-        docs = retrieve_docs(industry)
+    st.session_state["industry"] = industry_input
+    st.session_state["clarification_round"] = 1
+
+    result = check_ambiguity(industry_input)
+
+    if result == "CLEAR":
+        st.session_state["stage"] = "retrieve"
+    else:
+        st.session_state["clarification_questions"] = result
+        st.session_state["stage"] = "clarify"
+
+# -----------------------------
+# STEP 2: Clarification Flow
+# -----------------------------
+if st.session_state["stage"] == "clarify":
+
+    st.subheader("Clarification Needed")
+
+    st.info(st.session_state["clarification_questions"])
+
+    clarification = st.text_input("Provide more context (country, segment, B2B/B2C etc.)")
+
+    if st.button("Submit Clarification"):
+
+        combined_input = st.session_state["industry"] + " " + clarification
+        result = check_ambiguity(combined_input)
+
+        if result == "CLEAR":
+            st.session_state["industry"] = combined_input
+            st.session_state["stage"] = "retrieve"
+
+        else:
+            # Second round escalation
+            if st.session_state["clarification_round"] == 1:
+                st.session_state["clarification_round"] = 2
+                st.session_state["clarification_questions"] = (
+                    "Please specify keywords such as:\n"
+                    "- Country\n"
+                    "- Customer type\n"
+                    "- Specific product category\n"
+                    "- Market scope (global / regional)"
+                )
+            else:
+                st.session_state["industry"] = combined_input
+                st.session_state["stage"] = "retrieve"
+
+# -----------------------------
+# STEP 3: Retrieve + Rank
+# -----------------------------
+if st.session_state["stage"] == "retrieve":
+
+    st.subheader("Step 2: Retrieving Wikipedia Pages")
+
+    with st.spinner("Searching..."):
+        docs = retrieve_docs(st.session_state["industry"])
 
     if not docs:
         st.error("No pages found.")
         st.stop()
 
-    st.session_state["docs"] = docs
-    st.session_state["stage"] = "ranking"
-
-# -----------------------------
-# STEP 2: Ranking + Selection
-# -----------------------------
-if st.session_state["stage"] == "ranking" and st.session_state["docs"]:
-
-    st.subheader("Step 2: Relevance Ranking")
-
-    strong, weak = rank_documents(
-        st.session_state["industry"],
-        st.session_state["docs"]
-    )
+    strong, weak = rank_documents(st.session_state["industry"], docs)
 
     if len(strong) >= 5:
         st.success("5 highly relevant pages found.")
@@ -149,48 +200,35 @@ if st.session_state["stage"] == "ranking" and st.session_state["docs"]:
     else:
         st.warning(f"Only {len(strong)} strongly relevant pages found.")
 
-        st.markdown("### Strongly Relevant Pages")
-        for d in strong:
-            st.markdown(f"- {extract_title(d)}  \n{extract_url(d)}")
-
-        needed = 5 - len(strong)
-        fallback = weak[:needed]
-
-        st.markdown("### Additional Lower-Relevance Pages")
-        for d in fallback:
-            st.markdown(f"- {extract_title(d)}  \n{extract_url(d)}")
-
+        fallback = weak[:5 - len(strong)]
         combined = strong + fallback
+
         titles = [extract_title(d) for d in combined]
 
         selected = st.multiselect(
-            "Select up to 5 pages for report:",
+            "Select pages for report:",
             titles,
-            default=titles[:len(strong)]
+            default=titles
         )
 
         selected_docs = [d for d in combined if extract_title(d) in selected]
 
-        if len(selected_docs) > 0:
+        if selected_docs and st.button("Confirm Selection"):
             st.session_state["final_docs"] = selected_docs
-            if st.button("Confirm Selection"):
-                st.session_state["stage"] = "ready"
+            st.session_state["stage"] = "ready"
 
 # -----------------------------
-# STEP 3: Generate Report
+# STEP 4: Generate Report
 # -----------------------------
 if st.session_state["stage"] == "ready":
 
     st.subheader("Step 3: Generate Report")
 
-    if st.button("Generate Industry Report", type="primary"):
+    if st.button("Generate Report", type="primary"):
 
-        docs = st.session_state["final_docs"]
-        context = "\n\n".join([d.page_content for d in docs])
+        context = "\n\n".join([d.page_content for d in st.session_state["final_docs"]])
 
         prompt = f"""
-You are a professional market analyst.
-
 Write a structured industry brief under 500 words.
 
 Industry:
@@ -203,32 +241,17 @@ Format:
 ## Industry Brief
 
 ### Scope
-(1-2 sentences)
-
 ### Market Offering
-- bullet
-- bullet
-
 ### Value Chain
-- bullet
-- bullet
-
 ### Competitive Landscape
-- bullet
-- bullet
-
 ### Key Trends
-- bullet
-- bullet
-
 ### Limits
-(1-2 sentences)
 
 Context:
 {context}
 """
 
-        with st.spinner("Generating report..."):
+        with st.spinner("Generating..."):
             output = llm.invoke(prompt).content
 
         report = enforce_under_500(output)
@@ -244,7 +267,7 @@ if st.session_state["stage"] == "done":
     st.caption(f"Word count: {word_count(st.session_state['report'])}/500")
 
     st.download_button(
-        "Download Report (TXT)",
+        "Download Report",
         data=st.session_state["report"],
         file_name="industry_report.txt",
         mime="text/plain"
