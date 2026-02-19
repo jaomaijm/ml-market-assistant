@@ -31,6 +31,9 @@ defaults = {
     "force_keyword_text": "",     # manual typed
     "query_used": "",             # final query for retrieval
     "report": "",
+    # NEW: banner (so we can show a bar after context attempt fails)
+    "banner_text": "",
+    "banner_kind": "",            # "info" | "warning" | "error" | "success"
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -226,7 +229,6 @@ Context:
 """
     out = llm.invoke(prompt).content.strip()
 
-    # Enforce <= 500 words
     if word_count(out) > 500:
         out = " ".join(out.split()[:500])
 
@@ -238,7 +240,6 @@ def show_ranked_urls_section(ranked):
     st.subheader("Step 2: Top Wikipedia Pages (Ranked)")
     st.caption(f"Query used: {st.session_state.query_used}")
 
-    # Transparent status text (always show pages after round 2)
     if strong_count >= 5:
         st.success("Found strong matches (based on relevance scoring)")
     elif strong_count == 0:
@@ -255,6 +256,55 @@ def show_ranked_urls_section(ranked):
 """
     )
 
+def render_step_tracker():
+    # NEW: show all steps as user goes through (always visible)
+    stage = st.session_state.stage
+    done1 = bool(st.session_state.industry.strip())
+    done2 = bool(st.session_state.ranked_docs)
+    done3 = bool(st.session_state.report)
+
+    current = 1
+    if stage in ["clarify_1", "clarify_2", "force_keywords", "step2_results"]:
+        current = 2
+    if stage == "reported":
+        current = 3
+
+    def mark(done, stepnum):
+        if done and stepnum < current:
+            return "✅"
+        if stepnum == current:
+            return "➡️"
+        return "⬜"
+
+    st.markdown(
+        f"""
+### Progress
+- {mark(done1, 1)} **Step 1** Input
+- {mark(done2, 2)} **Step 2** Find relevant URLs
+- {mark(done3, 3)} **Step 3** Generate report
+"""
+    )
+    st.divider()
+
+def show_banner_if_any():
+    # NEW: show "bar" messages (once) without breaking flow
+    if st.session_state.banner_text:
+        kind = st.session_state.banner_kind or "info"
+        msg = st.session_state.banner_text
+
+        if kind == "warning":
+            st.warning(msg)
+        elif kind == "error":
+            st.error(msg)
+        elif kind == "success":
+            st.success(msg)
+        else:
+            st.info(msg)
+
+        # clear after showing once
+        st.session_state.banner_text = ""
+        st.session_state.banner_kind = ""
+
 def run_retrieval_and_ranking(query: str, force_show_results: bool = False):
     with st.spinner("Retrieving Wikipedia pages..."):
         docs = retrieve_docs(query)
@@ -266,10 +316,7 @@ def run_retrieval_and_ranking(query: str, force_show_results: bool = False):
     st.session_state.ranked_docs = ranked
     st.session_state.query_used = query
 
-    # ===== CHANGE YOU ASKED =====
-    # After the 2nd clarification attempt (clarify_round >= 2),
-    # ALWAYS show ranked URLs even if weak/no match.
-    # Then user chooses URLs for the report.
+    # If after round 2, ALWAYS show ranked URLs even if weak/no match
     if force_show_results or st.session_state.clarify_round >= 2:
         st.session_state.confidence_mode = "needs_help"
         st.session_state.stage = "step2_results"
@@ -281,14 +328,24 @@ def run_retrieval_and_ranking(query: str, force_show_results: bool = False):
         st.session_state.stage = "step2_results"
     else:
         st.session_state.confidence_mode = "needs_help"
-        if st.session_state.clarify_round == 0:
-            st.session_state.stage = "clarify_1"
-        elif st.session_state.clarify_round == 1:
+
+        # NEW: if user already provided context once and still weak -> show a bar + clickable keywords next
+        if st.session_state.clarify_round == 1:
+            st.session_state.banner_text = "Couldn’t find strong matches even after your clarification. Try one of the clickable keywords below to guide the search"
+            st.session_state.banner_kind = "warning"
             st.session_state.stage = "clarify_2"
+        elif st.session_state.clarify_round == 0:
+            st.session_state.stage = "clarify_1"
         else:
             st.session_state.stage = "force_keywords"
 
     st.rerun()
+
+# ==========================================================
+# ALWAYS SHOW STEP TRACKER + BANNER
+# ==========================================================
+render_step_tracker()
+show_banner_if_any()
 
 # ==========================================================
 # STEP 1 — USER INPUT
@@ -330,7 +387,6 @@ if st.session_state.stage == "clarify_1":
     st.subheader("Step 2: Clarification Needed (Round 1)")
     st.warning("I’m not confident I can pull the right pages yet. Add more detail so I don’t retrieve the wrong URLs")
 
-    # clickable context ideas
     if st.session_state.context_ideas:
         st.markdown("Pick a context idea (optional)")
         cols = st.columns(len(st.session_state.context_ideas))
@@ -363,16 +419,18 @@ if st.session_state.stage == "clarify_2":
     if not st.session_state.context_ideas:
         st.session_state.context_ideas = suggest_context_ideas(st.session_state.industry)
 
-    st.markdown("Optional: click a suggestion to add it")
+    # NEW: when user provided context but system still can’t find, show clickable keywords (in the same screen)
+    st.markdown("If you're stuck, click a suggestion to help you think")
     ideas = st.session_state.context_ideas[:6]
-    cols = st.columns(len(ideas)) if ideas else []
-    for i, idea in enumerate(ideas):
-        if cols[i].button(idea, use_container_width=True, key=f"idea2_{i}"):
-            st.session_state.clarification_2 = (
-                f"{st.session_state.clarification_2}, {idea}".strip(", ")
-                if st.session_state.clarification_2 else idea
-            )
-            st.rerun()
+    if ideas:
+        cols = st.columns(len(ideas))
+        for i, idea in enumerate(ideas):
+            if cols[i].button(idea, use_container_width=True, key=f"idea2_{i}"):
+                st.session_state.clarification_2 = (
+                    f"{st.session_state.clarification_2}, {idea}".strip(", ")
+                    if st.session_state.clarification_2 else idea
+                )
+                st.rerun()
 
     st.session_state.clarification_2 = st.text_input(
         "Add more context (regulation focus, geography, customer segment, subcategory)",
@@ -383,12 +441,10 @@ if st.session_state.stage == "clarify_2":
     if st.button("Retry again", type="primary"):
         st.session_state.clarify_round = 2
         query = build_query(st.session_state.industry, st.session_state.clarification_1, st.session_state.clarification_2)
-        # Force show ranked URLs after round 2 (your request)
         run_retrieval_and_ranking(query, force_show_results=True)
 
 # ==========================================================
 # STEP 2 PATH 2.3 — FORCE KEYWORDS (CLICK OR TYPE)
-# Still available as optional refinement (kept same)
 # ==========================================================
 def render_force_keyword_panel():
     st.markdown("### Refine with a forcing keyword (optional)")
@@ -401,7 +457,6 @@ def render_force_keyword_panel():
             st.session_state.clarification_2
         )
 
-    # chips
     if st.session_state.force_keywords:
         cols = st.columns(4)
         for idx, kw in enumerate(st.session_state.force_keywords):
@@ -443,7 +498,6 @@ if st.session_state.stage == "force_keywords":
 
 # ==========================================================
 # STEP 2 RESULTS — SHOW URLS + SCORES
-# CHANGE: after round 2, ALWAYS show ranked URLs + user MUST choose URLs for report
 # ==========================================================
 if st.session_state.stage == "step2_results":
     ranked = st.session_state.ranked_docs or []
@@ -483,16 +537,11 @@ if st.session_state.stage == "step2_results":
 
     # ======================================================
     # STEP 3 — REPORT
-    # CHANGE YOU ASKED:
-    # After round 2, always let user choose URLs then generate report
     # ======================================================
     st.subheader("Step 3: Report")
 
-    # If user reached step2_results via round 2 (or forced search after round 2),
-    # require selection regardless of scores
     require_selection = (st.session_state.clarify_round >= 2)
 
-    # If not in round 2, keep previous behavior (auto-generate when 5 strong)
     if not require_selection:
         strong_all = [x for x in ranked if x["score"] >= STRONG_THRESHOLD]
         auto_ok = len(strong_all) >= MIN_STRONG_FOR_AUTO
