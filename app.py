@@ -10,8 +10,7 @@ from langchain_openai import ChatOpenAI
 st.set_page_config(page_title="Market Research Assistant", page_icon="🔎", layout="wide")
 st.title("Market Research Assistant")
 st.caption(
-    "Step 1: enter an industry. Step 2: I retrieve and rank up to 5 Wikipedia pages. "
-    "Step 3: I generate a <500-word report using ONLY the selected pages"
+    "Hi! I'm your market research assistant. Give me your interested keyword and I will help you find most relevant URLs, then generate the report!"
 )
 
 # =========================================================
@@ -69,7 +68,7 @@ if not api_key_session:
 
 # Single runtime model (requirement)
 MODEL_NAME = "gpt-4.1-mini"
-llm = ChatOpenAI(model=MODEL_NAME, openai_api_key=api_key_session, temperature=0.2)
+llm = ChatOpenAI(model=MODEL_NAME, openai_api_key=api_key_session, temperature=0.1)
 
 TOP_K = 5
 LANG = "en"
