@@ -34,6 +34,8 @@ defaults = {
     "report": "",
     "api_key_session": "",
     "llm_option": "gpt-4.1-mini",
+    # NEW for Step 3 selection UI
+    "step3_pick_labels": [],
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -110,23 +112,16 @@ def _normalize_query(q: str) -> str:
     return q
 
 def _strip_parentheses(q: str) -> str:
-    # turns "pet (UK B2C)" -> "pet"
     return re.sub(r"\s*\([^)]*\)\s*", " ", (q or "")).strip()
 
 def retrieve_wikipedia_docs(query: str, top_k: int = 12):
-    # Increase retrieval pool so we can still DISPLAY 5 ranked URLs after dedupe
     retriever = WikipediaRetriever(top_k_results=top_k, lang=LANG)
     return retriever.invoke(query)
 
 def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> list:
-    """
-    Ensures we have at least 5 docs (or as many as Wikipedia can realistically return)
-    by trying several query variants and deduping by URL/title.
-    """
     primary_query = _normalize_query(primary_query)
     industry_fallback = _normalize_query(industry_fallback)
 
-    # Try a sequence of broader queries if the exact query is sparse
     candidates = []
     seen = set()
 
@@ -151,14 +146,12 @@ def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> l
         query_variants.append(f"{industry_fallback} industry")
         query_variants.append(f"{industry_fallback} market")
 
-    # Run variants until we have 5 unique docs, or we exhaust variants
     for q in query_variants:
         if len(candidates) >= TOP_K:
             break
         docs = retrieve_wikipedia_docs(q, top_k=12)
         add_docs(docs)
 
-    # Last-resort: if still <5, try a very broad "industry" keyword itself
     if len(candidates) < TOP_K:
         docs = retrieve_wikipedia_docs("Industry", top_k=12)
         add_docs(docs)
@@ -166,10 +159,6 @@ def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> l
     return candidates[: max(TOP_K, len(candidates))]
 
 def llm_rank_docs(industry_query: str, docs):
-    """
-    Returns ranked list: [{title,url,score,doc}, ...] sorted by score desc
-    Score is 0-100 relevance to the industry_query (not "quality")
-    """
     items = []
     for d in docs:
         title = extract_title(d)
@@ -223,9 +212,6 @@ Rules:
         ranked.append({"title": title, "url": url, "score": score, "doc": d})
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
-
-    # Ensure we DISPLAY 5 ranked items if possible by deduping missing URLs
-    # If some docs have no URL, still keep them, but rank list should have 5 entries when docs >=5
     return ranked[: max(TOP_K, len(ranked))]
 
 def confidence_from_scores(ranked):
@@ -410,6 +396,7 @@ if step1_go:
     st.session_state["show_keyword_picker"] = False
     st.session_state["selected_urls"] = []
     st.session_state["report"] = ""
+    st.session_state["step3_pick_labels"] = []
     st.session_state["step"] = 2
     st.rerun()
 
@@ -432,7 +419,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             )
             ranked = llm_rank_docs(st.session_state["final_query"], docs_pool)
 
-            # IMPORTANT: Always keep enough docs to SHOW 5 URLs
             st.session_state["docs"] = docs_pool
             st.session_state["ranked"] = ranked[:TOP_K] if len(ranked) >= TOP_K else ranked
             st.session_state["confidence"] = confidence_from_scores(st.session_state["ranked"])
@@ -442,12 +428,11 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             st.session_state["need_questions"] = "\n".join([f"- {q}" for q in qs])
             st.session_state["suggested_keywords"] = kws
 
-    # 2.1 Path 1: confident => show URLs + scores (ALWAYS show 5 if possible)
+    # 2.1 Path 1: confident => show URLs + scores
     if st.session_state.get("confidence") == "high":
         st.success("I’m confident these pages match your topic. Here are the top results with relevance scores")
 
         ranked = st.session_state.get("ranked", [])
-        # Ensure we display exactly 5 (or as many as we can if Wikipedia is truly sparse)
         if len(ranked) < TOP_K:
             st.info(f"Only found {len(ranked)} Wikipedia page(s) for this exact topic. I will still proceed with the best available pages")
         display_list = ranked[:TOP_K]
@@ -457,7 +442,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             st.markdown(f"**{i}. {title}**  \n{url}")
             st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100")
 
-        st.caption("Because relevance looks strong across the set, Step 3 will use these pages automatically")
+        st.caption("Step 3 will let you choose which pages to base the report on")
 
         go_step3 = st.button("Continue to Step 3", type="primary", use_container_width=True)
         if go_step3:
@@ -523,7 +508,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             st.session_state["show_keyword_picker"] = True
             st.rerun()
 
-        # 2.3 Forced keyword stage (Round 2) => ALWAYS try to gather >=5 docs
+        # 2.3 Forced keyword stage (Round 2)
         if st.session_state.get("show_keyword_picker"):
             st.divider()
             st.subheader("Forced keywords (Round 2)")
@@ -586,7 +571,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                     st.error("No Wikipedia pages found for the forced query. Try a different keyword")
                     st.stop()
 
-                # Always show up to 5 (ranked list already tries to be >=5)
                 show_list = ranked[:TOP_K]
                 if len(show_list) < TOP_K:
                     st.info(
@@ -602,9 +586,8 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                     st.markdown(f"**{label}**  \n{url}")
                     st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100")
 
-                # User selection always available here
                 chosen_labels = st.multiselect(
-                    "Select pages to use for the report (recommended: pick 3–5)",
+                    "Select pages to carry into Step 3 (recommended: pick 3–5)",
                     options=[lbl for (lbl, _) in url_options],
                     default=[lbl for (lbl, _) in url_options],
                 )
@@ -633,19 +616,38 @@ if st.session_state.get("step", 1) >= 3:
         st.info("Complete Step 2 first to retrieve Wikipedia pages")
         st.stop()
 
-    selected_urls = st.session_state.get("selected_urls", [])
-    docs_to_use = []
-    if selected_urls:
-        url_set = set(selected_urls)
-        docs_to_use = [r["doc"] for r in ranked_all if r.get("url") in url_set]
-    else:
-        docs_to_use = [r["doc"] for r in ranked_all[:TOP_K]]
+    # Build options from the ranked list (do NOT re-display as Step 2)
+    display_list = ranked_all[:TOP_K]
+    url_options = []
+    for i, r in enumerate(display_list, 1):
+        title, url, score = r.get("title", "Wikipedia page"), r.get("url", ""), r.get("score", 0)
+        label = f"{i}. {title} ({score}/100)"
+        url_options.append((label, url))
+
+    # Default selection: if Step 2 already set selected_urls, keep it; otherwise choose all displayed
+    prev_selected = st.session_state.get("selected_urls", [])
+    default_labels = [lbl for (lbl, u) in url_options if (u in prev_selected)] if prev_selected else [lbl for (lbl, _) in url_options]
 
     st.markdown(f"**Report topic:** {topic_for_report}")
-    st.markdown("**Sources used:**")
-    for r in ranked_all[:TOP_K]:
-        if r.get("doc") in docs_to_use:
-            st.markdown(f"- {r['title']} ({r['score']}/100)  \n  {r['url']}")
+    st.markdown("**Choose which pages to use for the report:**")
+    chosen_labels_step3 = st.multiselect(
+        "Select pages (3–5 recommended)",
+        options=[lbl for (lbl, _) in url_options],
+        default=default_labels,
+        key="step3_picker",
+    )
+
+    chosen_urls_step3 = [u for (lbl, u) in url_options if lbl in chosen_labels_step3 and u]
+    st.session_state["selected_urls"] = chosen_urls_step3
+
+    # Determine docs to use based on selection
+    docs_to_use = []
+    if chosen_urls_step3:
+        url_set = set(chosen_urls_step3)
+        docs_to_use = [r["doc"] for r in ranked_all if r.get("url") in url_set]
+    else:
+        st.warning("Please select at least 1 page to generate the report")
+        st.stop()
 
     gen_col1, gen_col2 = st.columns(2)
     with gen_col1:
