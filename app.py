@@ -862,7 +862,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
 # -----------------------------
 # STEP 3
 # -----------------------------
-st.subheader("Step 3: Writing your report)")
+st.subheader("Step 3: Writing your report")
 
 if st.session_state.get("step", 1) >= 3:
     topic_for_report = (
