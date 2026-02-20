@@ -114,28 +114,70 @@ def stepper():
     st.divider()
 
 def looks_like_input(text: str) -> bool:
+    # ✅ FIX: accept meaningful 2–3 char inputs (AI, EV, UK, SEO, CRM, etc.)
     t = (text or "").strip()
-    if len(t) < 3:
+    if len(t) < 2:
         return False
     if re.fullmatch(r"[\W_]+", t):
         return False
     return True
 
+# -----------------------------
+# ✅ FIX: stop over-blocking short meaningful words
+# - remove hard ">=4 chars" rule
+# - allow acronyms (2–4 uppercase letters), common short tokens, and common country codes
+# - use Wikipedia sanity check as the real gate for short inputs
+# -----------------------------
+COMMON_SHORT_OK = {
+    "ai", "ml", "nlp", "ev", "vr", "ar", "ux", "ui", "seo", "sem", "crm", "erp", "saas",
+    "iot", "fintech", "insurtech", "edtech", "biotech",
+    "uk", "us", "uae", "eu", "asean", "apac"
+}
+
+def is_short_but_allowed(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    low = t.lower()
+    if low in COMMON_SHORT_OK:
+        return True
+    # Acronyms: 2–5 letters, mostly uppercase (e.g., GDP, ESG, FMCG)
+    if re.fullmatch(r"[A-Z]{2,5}", t):
+        return True
+    # Alpha+digit short tokens (e.g., 3G, 4G, 5G)
+    if re.fullmatch(r"[A-Za-z]{1,3}\d{1,2}", t):
+        return True
+    return False
+
 def is_probably_gibberish_or_incomplete(text: str):
+    """
+    ✅ FIX: Only block truly suspicious input.
+    Short meaningful terms are allowed; Wikipedia sanity check will validate relevance.
+    """
     t = (text or "").strip()
     low = t.lower()
 
-    if len(low) < 4:
-        return True, "Too short. Please enter a full industry/topic (at least 4 characters)"
+    if len(low) < 2:
+        return True, "Too short. Please type a real industry/topic (at least 2 characters)"
 
+    # If it's short (<=3) but allowed acronym/token, don't flag as gibberish
+    if len(low) <= 3 and is_short_but_allowed(t):
+        return False, ""
+
+    # If it's very short (2–3) and NOT allowed, don't hard-block; just warn via sanity check later
+    # (so user can still try "tea", "pet", etc.)
+    # We only hard-block if it looks like random characters.
     letters = re.findall(r"[a-z]", low)
     if len(letters) >= 5:
         vowels = sum(ch in "aeiou" for ch in letters)
-        if vowels / max(1, len(letters)) < 0.25:
+        if vowels / max(1, len(letters)) < 0.2:
             return True, "Looks like random letters. Please type a real word or phrase (e.g., 'electric vehicles')"
 
-    if " " not in low and len(low) <= 6:
-        if low.endswith(("r", "t", "c", "m", "v", "n", "l")) and not low.endswith(("ing", "ion", "ics")):
+    # Incomplete single-word heuristic:
+    # Only apply when length >= 5 (so 'pet', 'tea', 'oil' are not punished)
+    if " " not in low and len(low) >= 5:
+        # likely truncated stems
+        if low.endswith(("r", "t", "c", "m", "v", "n", "l")) and not low.endswith(("ing", "ion", "ics", "tech")):
             return True, "Looks like an incomplete word. Please type the full industry name (e.g., 'electric vehicles')"
 
     return False, ""
@@ -164,6 +206,11 @@ def retrieve_wikipedia_docs(query: str, top_k: int = 12):
     return retriever.invoke(query)
 
 def wiki_sanity_check(industry_text: str):
+    """
+    ✅ FIX: treat short inputs fairly:
+    - If user input is short but Wikipedia returns pages, accept it
+    - If Wikipedia returns nothing, ask user to clarify instead of calling it random
+    """
     q = _normalize_query(industry_text)
     try:
         docs = retrieve_wikipedia_docs(q, top_k=5)
@@ -171,16 +218,19 @@ def wiki_sanity_check(industry_text: str):
         docs = []
 
     if not docs:
-        return False, "I couldn't find any Wikipedia pages for that. Please re-type with a real industry/topic", []
+        return False, "I couldn't find any Wikipedia pages for that. Please re-type or add 1–2 clarifying words", []
 
     titles = [extract_title(d).lower() for d in docs if d is not None]
     if len(titles) < 2:
-        return False, "I found too little to confirm what you mean. Please type a clearer industry/topic", docs
+        return False, "I found too little to confirm what you mean. Please add a bit more context (country, segment, B2B/B2C)", docs
 
     low = q.lower()
-    if " " not in low and len(low) <= 6:
+
+    # Only apply partial-word check for short single-words that are NOT known acronyms/tokens
+    if " " not in low and len(low) <= 6 and not is_short_but_allowed(q):
+        # If none of the titles contain the token, it might be a typo or partial
         if not any(low in t for t in titles):
-            return False, "This looks like a partial word. Please type the full industry name (example: 'electric vehicles')", docs
+            return False, "This might be a typo or partial word. Please re-type or add context (e.g., 'EV market', 'pet care')", docs
 
     return True, "", docs
 
@@ -469,77 +519,55 @@ def relevance_bucket(score: int) -> str:
         return "Related"
     return "Weak match"
 
-# ---------- UPDATED: explanations should match CURRENT keywords (topic + chosen urls) ----------
-def llm_explain_pages_for_choice(topic: str, ranked_all: list, chosen_urls: list) -> list:
-    """
-    Explanations ONLY for pages the user selected (in the order of ranked_all filtered)
-    """
+def llm_explain_pages_for_choice(topic: str, ranked_all: list, chosen_urls: list):
     url_set = set(chosen_urls or [])
     selected = [r for r in (ranked_all or []) if (r.get("url") and r.get("url") in url_set)]
-
-    pages = []
-    for r in selected[:TOP_K]:
-        pages.append({
-            "title": r.get("title", ""),
-            "url": r.get("url", ""),
-            "score": int(r.get("score", 0)),
-        })
-
-    if not pages:
+    if not selected:
         return []
-
-    prompt = f"""
-You are helping a user choose Wikipedia pages for a market research report.
-
-User topic:
-{topic}
-
-Selected pages (JSON):
-{json.dumps(pages, ensure_ascii=False)}
-
-Task:
-For each page, write ONE short explanation (max 18 words):
-- what the page is about (based on title/category)
-- why it fits or is weak for THIS topic
-
-Return ONLY valid JSON:
-{{
-  "explanations": [
-    {{"title":"...","url":"...","explain":"..."}},
-    ...
-  ]
-}}
-Rules:
-- Keep explanations short and plain
-- Be consistent with the topic above
-- Do not invent facts beyond what title suggests
-""".strip()
-
-    out = []
-    try:
-        raw = llm.invoke(prompt).content.strip()
-        data = safe_json_loads(raw)
-        if data and isinstance(data.get("explanations", None), list):
-            out = data["explanations"]
-    except Exception:
-        out = []
-
-    exp_map = {}
-    for e in out:
-        exp_map[(str(e.get("title","")), str(e.get("url","")))] = str(e.get("explain","")).strip()
 
     explanations = []
     for r in selected[:TOP_K]:
-        key = (r.get("title",""), r.get("url",""))
-        explain = exp_map.get(key, "")
-        if not explain:
-            explain = "General reference page; may be broad relative to your market topic"
-        explanations.append({
-            "title": r.get("title","Wikipedia page"),
-            "url": r.get("url",""),
-            "score": int(r.get("score", 0)),
-            "explain": explain
-        })
+        title = r.get("title", "Wikipedia page")
+        url = r.get("url", "")
+        score = int(r.get("score", 0))
+
+        prompt = f"""
+User topic:
+{topic}
+
+Wikipedia page title:
+{title}
+
+Relevance score:
+{score}
+
+Write ONE short explanation (max 18 words):
+- What this page is about (based on title)
+- Why it is relevant or partially relevant to the topic
+
+Be precise.
+Do NOT say "general reference page".
+Do NOT be vague.
+""".strip()
+
+        explanation_text = ""
+        try:
+            raw = llm.invoke(prompt).content.strip()
+            if raw and len(raw) > 10:
+                explanation_text = raw
+        except Exception:
+            explanation_text = ""
+
+        if not explanation_text:
+            bucket = relevance_bucket(score)
+            if bucket == "Strong match":
+                explanation_text = f"Directly aligned with {topic}; likely core reference for this market topic."
+            elif bucket == "Related":
+                explanation_text = f"Touches a related angle of {topic}; useful context even if not market-specific."
+            else:
+                explanation_text = f"Weak match to {topic}; may only help as background, not a direct market signal."
+
+        explanations.append({"title": title, "url": url, "score": score, "explain": explanation_text})
 
     return explanations
 
@@ -563,7 +591,7 @@ st.subheader("Step 1: Input")
 industry_input = st.text_input(
     "Industry",
     value=st.session_state.get("industry", ""),
-    placeholder="Example: pet companionship market, EV charging, cosmetics in Vietnam",
+    placeholder="Example: EV, AI, pet companionship market, cosmetics in Vietnam",
     label_visibility="collapsed",
 )
 
@@ -590,7 +618,7 @@ if step1_go:
     bad, reason = is_probably_gibberish_or_incomplete(industry_input)
     if bad:
         st.warning(reason)
-        st.info("Examples: 'electric vehicles', 'pet companionship market', 'cosmetics in Vietnam'")
+        st.info("Examples: 'EV', 'AI', 'pet companionship market', 'cosmetics in Vietnam'")
         st.stop()
 
     ok, msg, preview_docs = wiki_sanity_check(industry_input)
@@ -855,7 +883,6 @@ if st.session_state.get("step", 1) >= 3:
     )
     st.markdown(f"**Report topic:** {topic_for_report}")
 
-    # Selection UI first (UNCHANGED)
     url_options = []
     for i, r in enumerate(ranked_all, 1):
         title = r.get("title", "Wikipedia page")
@@ -882,7 +909,6 @@ if st.session_state.get("step", 1) >= 3:
         st.warning("Please select at least 1 page (with a valid URL) to generate the report")
         st.stop()
 
-    # ✅ CHANGE YOU ASKED: explanation dropdown comes AFTER selection and must match CURRENT keywords/topic
     with st.expander("Brief explanation of the pages you selected (to help you double-check)"):
         try:
             expl = llm_explain_pages_for_choice(topic_for_report, ranked_all, chosen_urls_step3)
@@ -904,7 +930,6 @@ if st.session_state.get("step", 1) >= 3:
                 st.markdown(f"{url}")
                 st.divider()
 
-    # docs to use
     url_set = set(chosen_urls_step3)
     docs_to_use = []
     for r in ranked_all:
