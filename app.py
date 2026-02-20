@@ -82,23 +82,16 @@ RELATED_MIN = 60
 # Helpers
 # =========================================================
 def stepper():
-    # Better UX: compact progress + tabs-like labels
+    """
+    Keep ONLY a progress bar (no extra step labels)
+
+    NOTE: Streamlit cannot "sticky pin" UI on scroll in Python-only code.
+    This will remain at the top of the page, and users can always see it
+    by using the browser/page scroll-to-top. True sticky requires custom CSS/JS.
+    """
     s = int(st.session_state.get("step", 1))
     progress_value = {1: 1/3, 2: 2/3, 3: 1.0}.get(s, 1/3)
-
     st.progress(progress_value, text=f"Progress: Step {s} of 3")
-
-    cols = st.columns(3)
-    labels = ["Input", "URLs", "Report"]
-
-    for i, label in enumerate(labels, start=1):
-        if i < s:
-            cols[i-1].markdown(f"✅ **Step {i}**  \n{label}")
-        elif i == s:
-            cols[i-1].markdown(f"🟦 **Step {i}**  \n{label}")
-        else:
-            cols[i-1].markdown(f"⬜ **Step {i}**  \n{label}")
-
     st.divider()
 
 def looks_like_input(text: str) -> bool:
@@ -467,7 +460,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
         f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match"
     )
 
-    # 2.0 First attempt (auto)
     if not st.session_state.get("ranked"):
         with st.spinner("Searching Wikipedia and ranking results..."):
             docs_pool = retrieve_at_least_five_docs(
@@ -485,13 +477,10 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             st.session_state["need_questions"] = "\n".join([f"- {q}" for q in qs])
             st.session_state["suggested_keywords"] = kws
 
-    # 2.1 Path 1: confident => show URLs + scores
     if st.session_state.get("confidence") == "high":
         st.success("I’m confident these pages match your topic. Here are the top results with relevance scores")
 
         ranked = st.session_state.get("ranked", [])
-        if len(ranked) < TOP_K:
-            st.info(f"Only found {len(ranked)} Wikipedia page(s) for this exact topic. I will still proceed with the best available pages")
         display_list = ranked[:TOP_K]
 
         for i, r in enumerate(display_list, 1):
@@ -506,7 +495,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             st.session_state["step"] = 3
             st.rerun()
 
-    # 2.2 Path 2: not confident => ask clarification (Round 1)
     if st.session_state.get("confidence") == "low":
         st.warning("I’m not confident the pages fully match what you mean. Help me narrow it down")
 
@@ -564,7 +552,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             st.session_state["show_keyword_picker"] = True
             st.rerun()
 
-        # 2.3 Forced keyword stage (Round 2)
         if st.session_state.get("show_keyword_picker"):
             st.divider()
             st.subheader("Forced keywords (Round 2)")
@@ -623,16 +610,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 st.markdown(f"**Forced topic used:** {st.session_state.get('forced_query','').strip()}")
 
                 ranked = st.session_state.get("ranked", [])
-                if not ranked:
-                    st.error("No Wikipedia pages found for the forced query. Try a different keyword")
-                    st.stop()
-
                 show_list = ranked[:TOP_K]
-                if len(show_list) < TOP_K:
-                    st.info(
-                        f"Only found {len(show_list)} Wikipedia page(s) for this forced topic. "
-                        f"I will still proceed with the best available pages"
-                    )
 
                 url_options = []
                 for i, r in enumerate(show_list, 1):
@@ -697,7 +675,6 @@ if st.session_state.get("step", 1) >= 3:
 
     st.markdown(f"**Report topic:** {topic_for_report}")
 
-    st.markdown("**Choose which pages to use for the report:**")
     chosen_labels_step3 = st.multiselect(
         "Select pages (3–5 recommended)",
         options=[lbl for (lbl, _) in url_options],
