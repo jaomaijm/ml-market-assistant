@@ -20,8 +20,8 @@ defaults = {
     "clarification": "",
     "final_query": "",
     "docs": [],
-    "ranked": [],  # list of dicts: {title,url,score,reason,doc}
-    "confidence": "unknown",  # "high" | "medium" | "low"
+    "ranked": [],  # list of dicts: {title,url,score,doc}
+    "confidence": "unknown",  # "high" | "low"
     "need_questions": "",
     "suggested_keywords": [],
     "keyword_pick": [],
@@ -33,7 +33,6 @@ defaults = {
     "api_key_session": "",
     "llm_option": "gpt-4.1-mini",
     "last_error": "",
-    "log_events": [],  # lightweight audit trail (query, scores, selections)
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -71,14 +70,11 @@ if not api_key_session:
     st.stop()
 
 # =========================================================
-# LLM init (same model, different temps for different tasks)
+# LLM init (guard)
 # =========================================================
 MODEL_NAME = "gpt-4.1-mini"
 try:
-    # Deterministic judge
-    llm_judge = ChatOpenAI(model=MODEL_NAME, openai_api_key=api_key_session, temperature=0.0)
-    # Slight creativity for writing, still controlled
-    llm_writer = ChatOpenAI(model=MODEL_NAME, openai_api_key=api_key_session, temperature=0.15)
+    llm = ChatOpenAI(model=MODEL_NAME, openai_api_key=api_key_session, temperature=0.1)
 except Exception as e:
     st.error("LLM init error. Please re-check your API key and try again")
     st.code(str(e))
@@ -87,13 +83,11 @@ except Exception as e:
 TOP_K = 5
 LANG = "en"
 
-# Score buckets (transparent + consistent)
-STRONG_MATCH_MIN = 70   # 70–100
-RELATED_MIN = 60        # 60–69
-WEAK_MAX = 59           # 0–59
+STRONG_MATCH_MIN = 70
+RELATED_MIN = 60
 
 # =========================================================
-# Safe utilities to prevent common Streamlit / parsing errors
+# Safe utilities
 # =========================================================
 def safe_json_loads(raw: str):
     try:
@@ -106,11 +100,9 @@ def safe_list_default(options, default_list):
     cleaned = [x for x in (default_list or []) if x in opt_set]
     return cleaned
 
-def log_event(event_type: str, payload: dict):
-    try:
-        st.session_state["log_events"].append({"type": event_type, **(payload or {})})
-    except Exception:
-        pass
+def safe_rerun_reset_error():
+    st.session_state["last_error"] = ""
+    st.rerun()
 
 # =========================================================
 # Helpers
@@ -118,16 +110,8 @@ def log_event(event_type: str, payload: dict):
 def stepper():
     s = int(st.session_state.get("step", 1))
     progress_value = {1: 1/3, 2: 2/3, 3: 1.0}.get(s, 1/3)
-    # sticky progress bar (visible while scrolling)
-    st.markdown(
-        f"""
-        <div style="position:sticky; top:0; z-index:999; background:white; padding:8px 0 10px 0; border-bottom:1px solid #eee;">
-            <div style="font-size:14px; margin-bottom:6px;"><b>Progress</b>: Step {s} of 3</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.progress(progress_value)
+    st.progress(progress_value, text=f"Progress: Step {s} of 3")
+    st.divider()
 
 def looks_like_input(text: str) -> bool:
     t = (text or "").strip()
@@ -150,10 +134,9 @@ def is_probably_gibberish_or_incomplete(text: str):
         if vowels / max(1, len(letters)) < 0.25:
             return True, "Looks like random letters. Please type a real word or phrase (e.g., 'electric vehicles')"
 
-    # common incomplete-token pattern: single short token without spaces
     if " " not in low and len(low) <= 6:
-        if not low.endswith(("ing", "ion", "ics", "ers", "ies", "ment")):
-            return True, "Looks like an incomplete word. Please type the full industry/topic (e.g., 'electric vehicles')"
+        if low.endswith(("r", "t", "c", "m", "v", "n", "l")) and not low.endswith(("ing", "ion", "ics")):
+            return True, "Looks like an incomplete word. Please type the full industry name (e.g., 'electric vehicles')"
 
     return False, ""
 
@@ -167,13 +150,6 @@ def extract_url(doc) -> str:
 def extract_title(doc) -> str:
     md = getattr(doc, "metadata", {}) or {}
     return (md.get("title") or md.get("page_title") or "Wikipedia page").strip()
-
-def construct_wikipedia_url_from_title(title: str) -> str:
-    t = (title or "").strip()
-    if not t or t.lower() == "wikipedia page":
-        return ""
-    t = t.replace(" ", "_")
-    return f"https://en.wikipedia.org/wiki/{t}"
 
 def _normalize_query(q: str) -> str:
     q = (q or "").strip()
@@ -204,15 +180,10 @@ def wiki_sanity_check(industry_text: str):
     low = q.lower()
     if " " not in low and len(low) <= 6:
         if not any(low in t for t in titles):
-            return False, "This looks like a partial word. Please type the full industry/topic (example: 'electric vehicles')", docs
+            return False, "This looks like a partial word. Please type the full industry name (example: 'electric vehicles')", docs
 
     return True, "", docs
 
-# =========================================================
-# Retrieval strategy: avoid generic filler queries (more defensible academically)
-# - We try query variants tightly related to the user's intent
-# - If still <5 unique pages, we will show placeholders (transparent)
-# =========================================================
 def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> list:
     primary_query = _normalize_query(primary_query)
     industry_fallback = _normalize_query(industry_fallback)
@@ -237,9 +208,8 @@ def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> l
             _strip_parentheses(primary_query),
             f"{primary_query} industry",
             f"{primary_query} market",
-            f"{primary_query} economics",
         ]
-    if industry_fallback and industry_fallback != primary_query:
+    if industry_fallback:
         query_variants += [
             industry_fallback,
             f"{industry_fallback} industry",
@@ -255,38 +225,26 @@ def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> l
             docs = []
         add_docs(docs)
 
+    if len(candidates) < TOP_K:
+        try:
+            docs = retrieve_wikipedia_docs("Industry", top_k=12)
+        except Exception:
+            docs = []
+        add_docs(docs)
+
     return candidates
 
-def relevance_bucket(score: int) -> str:
-    if score >= STRONG_MATCH_MIN:
-        return "Strong match"
-    if score >= RELATED_MIN:
-        return "Related"
-    return "Weak match"
-
-# =========================================================
-# LLM judge: score + short reason (this is a big “distinction” upgrade)
-# =========================================================
 def llm_rank_docs(industry_query: str, docs):
     items = []
     for d in docs or []:
         title = extract_title(d)
         url = extract_url(d)
-        if not url:
-            url = construct_wikipedia_url_from_title(title)
         snippet = (getattr(d, "page_content", "") or "").strip().replace("\n", " ")
         snippet = snippet[:900]
         items.append({"title": title, "url": url, "snippet": snippet})
 
     if not items:
-        # return 5 placeholders transparently
-        return [{
-            "title": f"Placeholder (no Wikipedia match found) #{i+1}",
-            "url": "",
-            "score": 0,
-            "reason": "No Wikipedia results could be retrieved for this query",
-            "doc": None
-        } for i in range(TOP_K)]
+        return []
 
     judge_prompt = f"""
 You are scoring relevance of Wikipedia pages to a user's market research topic.
@@ -300,23 +258,22 @@ Pages (JSON):
 Return ONLY valid JSON:
 {{
   "scores": [
-    {{"title":"...","url":"...","score": 0, "reason":"..."}},
+    {{"title":"...","url":"...","score": 0}},
     ...
   ]
 }}
 
 Rules:
 - score is integer 0-100
-- reason is ONE short sentence (max 14 words) explaining relevance
-- score 70-100: directly supports the user topic
-- score 60-69: related but broader / partial match
+- score 90-100: directly about the industry/market/topic
+- score 60-89: related but broader / partial match
 - score 0-59: weak match / mostly unrelated
 - do NOT add extra keys
 """.strip()
 
     scores = None
     try:
-        raw = llm_judge.invoke(judge_prompt).content.strip()
+        raw = llm.invoke(judge_prompt).content.strip()
         data = safe_json_loads(raw)
         if data and isinstance(data.get("scores", None), list):
             scores = data["scores"]
@@ -324,56 +281,39 @@ Rules:
         scores = None
 
     if scores is None:
-        scores = [{"title": it["title"], "url": it["url"], "score": 55, "reason": "Could not parse judge output; defaulted score"} for it in items]
+        scores = [{"title": it["title"], "url": it["url"], "score": 55} for it in items]
 
-    score_map = {}
-    for s in scores:
-        key = (str(s.get("title", "")), str(s.get("url", "")))
-        score_map[key] = {
-            "score": int(s.get("score", 0)),
-            "reason": str(s.get("reason", "")).strip() or "No reason provided"
-        }
+    score_map = {(s.get("title",""), s.get("url","")): int(s.get("score", 0)) for s in scores}
 
     ranked = []
     for d in docs or []:
         title = extract_title(d)
-        url = extract_url(d) or construct_wikipedia_url_from_title(title)
-        meta = score_map.get((title, url), {"score": 50, "reason": "No judge match; defaulted score"})
-        ranked.append({
-            "title": title,
-            "url": url,
-            "score": int(meta["score"]),
-            "reason": meta["reason"],
-            "doc": d
-        })
+        url = extract_url(d)
+        score = score_map.get((title, url), 50)
+        ranked.append({"title": title, "url": url, "score": score, "doc": d})
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
 
-    # Ensure 5 items shown (transparent placeholders if needed)
     if len(ranked) < TOP_K:
         for i in range(TOP_K - len(ranked)):
             ranked.append({
-                "title": f"Placeholder (insufficient Wikipedia results) #{i+1}",
+                "title": f"Placeholder (no strong Wikipedia match found) #{i+1}",
                 "url": "",
                 "score": 0,
-                "reason": "Wikipedia returned too few distinct pages for this query",
                 "doc": None
             })
 
     return ranked[:TOP_K]
 
-# More interpretable confidence rule (also a “distinction” upgrade)
 def confidence_from_scores(ranked):
-    scores = [int(r.get("score", 0)) for r in (ranked or [])[:TOP_K]]
-    strong = sum(1 for s in scores if s >= STRONG_MATCH_MIN)
-    related = sum(1 for s in scores if RELATED_MIN <= s < STRONG_MATCH_MIN)
-
-    # High = at least 4 strong matches
-    if strong >= 4:
+    if not ranked:
+        return "low"
+    scores = [r["score"] for r in ranked[:TOP_K] if isinstance(r.get("score", None), int)]
+    if len(scores) < 3:
+        return "low"
+    avg = sum(scores) / len(scores)
+    if avg >= 78 and min(scores) >= 65:
         return "high"
-    # Medium = at least 2 strong OR 3+ related
-    if strong >= 2 or related >= 3:
-        return "medium"
     return "low"
 
 def build_query(industry: str, clarification: str) -> str:
@@ -384,10 +324,9 @@ def build_query(industry: str, clarification: str) -> str:
     return industry
 
 def generate_clarifying_questions(industry: str, ranked):
-    titles = [r.get("title", "") for r in (ranked or [])[:TOP_K]]
-    urls = [r.get("url", "") for r in (ranked or [])[:TOP_K]]
-    scores = [int(r.get("score", 0)) for r in (ranked or [])[:TOP_K]]
-    reasons = [r.get("reason", "") for r in (ranked or [])[:TOP_K]]
+    titles = [r["title"] for r in ranked[:TOP_K]]
+    urls = [r["url"] for r in ranked[:TOP_K]]
+    scores = [r["score"] for r in ranked[:TOP_K]]
 
     prompt = f"""
 You are trying to avoid pulling the wrong Wikipedia pages for market research.
@@ -395,8 +334,8 @@ You are trying to avoid pulling the wrong Wikipedia pages for market research.
 User input:
 {industry}
 
-Top pages found (title | score | reason | url):
-{chr(10).join([f"- {t} | {s} | {rs} | {u}" for t,s,rs,u in zip(titles, scores, reasons, urls)])}
+Top pages found (title | score | url):
+{chr(10).join([f"- {t} | {s} | {u}" for t,s,u in zip(titles, scores, urls)])}
 
 Task:
 Write 3–4 short clarifying questions to disambiguate the user's intent.
@@ -411,7 +350,7 @@ Return ONLY valid JSON:
 
     qs, kws = None, None
     try:
-        raw = llm_judge.invoke(prompt).content.strip()
+        raw = llm.invoke(prompt).content.strip()
         data = safe_json_loads(raw)
         if data:
             qs = data.get("questions", [])
@@ -426,7 +365,7 @@ Return ONLY valid JSON:
             "Which sub-segment do you mean (products, services, adoption, retail, etc.)",
         ]
     if not kws or not isinstance(kws, list):
-        kws = ["UK", "Thailand", "B2C", "B2B", "Companion animals", "Pet adoption", "Retail", "E-commerce"]
+        kws = ["UK", "Thailand", "B2C", "B2B", "Retail", "E-commerce", "Premium", "Mass market"]
 
     qs = [str(q).strip() for q in qs if str(q).strip()]
     kws = [str(k).strip() for k in kws if str(k).strip()]
@@ -451,7 +390,7 @@ Report:
 {current}
 """.strip()
         try:
-            current = llm_writer.invoke(compress_prompt).content.strip()
+            current = llm.invoke(compress_prompt).content.strip()
         except Exception:
             break
     tokens = current.split()
@@ -511,7 +450,7 @@ Wikipedia context:
 """.strip()
 
     try:
-        out = llm_writer.invoke(prompt).content.strip()
+        out = llm.invoke(prompt).content.strip()
     except Exception:
         out = (
             "## Industry brief: " + (topic or "Unknown") + "\n\n"
@@ -523,16 +462,31 @@ Wikipedia context:
 
     return enforce_under_500_words(out)
 
-# ---------- brief explanation per URL (after selection, to help final choice) ----------
-def llm_explain_pages(topic: str, ranked_list: list) -> list:
+def relevance_bucket(score: int) -> str:
+    if score >= STRONG_MATCH_MIN:
+        return "Strong match"
+    if score >= RELATED_MIN:
+        return "Related"
+    return "Weak match"
+
+# ---------- UPDATED: explanations should match CURRENT keywords (topic + chosen urls) ----------
+def llm_explain_pages_for_choice(topic: str, ranked_all: list, chosen_urls: list) -> list:
+    """
+    Explanations ONLY for pages the user selected (in the order of ranked_all filtered)
+    """
+    url_set = set(chosen_urls or [])
+    selected = [r for r in (ranked_all or []) if (r.get("url") and r.get("url") in url_set)]
+
     pages = []
-    for r in (ranked_list or [])[:TOP_K]:
+    for r in selected[:TOP_K]:
         pages.append({
             "title": r.get("title", ""),
             "url": r.get("url", ""),
             "score": int(r.get("score", 0)),
-            "reason": r.get("reason", "")
         })
+
+    if not pages:
+        return []
 
     prompt = f"""
 You are helping a user choose Wikipedia pages for a market research report.
@@ -540,13 +494,13 @@ You are helping a user choose Wikipedia pages for a market research report.
 User topic:
 {topic}
 
-Pages (JSON):
+Selected pages (JSON):
 {json.dumps(pages, ensure_ascii=False)}
 
 Task:
 For each page, write ONE short explanation (max 18 words):
-- what the page is about (very general)
-- why it helps OR why it may be weak for the user topic
+- what the page is about (based on title/category)
+- why it fits or is weak for THIS topic
 
 Return ONLY valid JSON:
 {{
@@ -557,12 +511,13 @@ Return ONLY valid JSON:
 }}
 Rules:
 - Keep explanations short and plain
-- Do not invent facts beyond what title/snippet implies
+- Be consistent with the topic above
+- Do not invent facts beyond what title suggests
 """.strip()
 
     out = []
     try:
-        raw = llm_judge.invoke(prompt).content.strip()
+        raw = llm.invoke(prompt).content.strip()
         data = safe_json_loads(raw)
         if data and isinstance(data.get("explanations", None), list):
             out = data["explanations"]
@@ -574,23 +529,27 @@ Rules:
         exp_map[(str(e.get("title","")), str(e.get("url","")))] = str(e.get("explain","")).strip()
 
     explanations = []
-    for r in (ranked_list or [])[:TOP_K]:
+    for r in selected[:TOP_K]:
         key = (r.get("title",""), r.get("url",""))
         explain = exp_map.get(key, "")
         if not explain:
             explain = "General reference page; may be broad relative to your market topic"
-        explanations.append(explain)
+        explanations.append({
+            "title": r.get("title","Wikipedia page"),
+            "url": r.get("url",""),
+            "score": int(r.get("score", 0)),
+            "explain": explain
+        })
 
     return explanations
 
 # =========================================================
-# Global error banner (non-blocking)
+# Global error banner
 # =========================================================
 if st.session_state.get("last_error"):
     st.error(st.session_state["last_error"])
     if st.button("Clear error message", use_container_width=True):
-        st.session_state["last_error"] = ""
-        st.rerun()
+        safe_rerun_reset_error()
 
 # =========================================================
 # UI
@@ -631,7 +590,7 @@ if step1_go:
     bad, reason = is_probably_gibberish_or_incomplete(industry_input)
     if bad:
         st.warning(reason)
-        st.info("Examples you can try: 'electric vehicles', 'pet companionship market', 'cosmetics in Vietnam'")
+        st.info("Examples: 'electric vehicles', 'pet companionship market', 'cosmetics in Vietnam'")
         st.stop()
 
     ok, msg, preview_docs = wiki_sanity_check(industry_input)
@@ -659,7 +618,6 @@ if step1_go:
     st.session_state["report"] = ""
     st.session_state["last_error"] = ""
     st.session_state["step"] = 2
-    log_event("step1_submit", {"industry": st.session_state["industry"]})
     st.rerun()
 
 # -----------------------------
@@ -671,7 +629,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
     st.markdown(f"**Current topic:** {st.session_state.get('final_query','').strip() or st.session_state.get('industry','').strip()}")
     st.caption(
         f"Relevance score guide: {STRONG_MATCH_MIN}–100 = Strong match, "
-        f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{WEAK_MAX} = Weak match"
+        f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match"
     )
 
     if not st.session_state.get("ranked"):
@@ -687,13 +645,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             st.session_state["ranked"] = ranked
             st.session_state["confidence"] = confidence_from_scores(ranked)
 
-            log_event("step2_first_rank", {
-                "query": st.session_state["final_query"],
-                "confidence": st.session_state["confidence"],
-                "scores": [{"title": r["title"], "score": r["score"]} for r in ranked]
-            })
-
-            if st.session_state["confidence"] in ["low", "medium"]:
+            if st.session_state["confidence"] == "low":
                 qs, kws = generate_clarifying_questions(st.session_state["final_query"], ranked)
                 st.session_state["need_questions"] = "\n".join([f"- {q}" for q in qs])
                 st.session_state["suggested_keywords"] = kws
@@ -706,27 +658,21 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
     ranked = st.session_state.get("ranked", [])[:TOP_K]
 
     if st.session_state.get("confidence") == "high":
-        st.success("I’m confident these pages match your topic. Here are the top results with relevance scores + reasons")
+        st.success("I’m confident these pages match your topic. Here are the top results with relevance scores")
 
         for i, r in enumerate(ranked, 1):
-            title = r.get("title", "Wikipedia page")
-            url = r.get("url", "")
+            st.markdown(f"**{i}. {r['title']}**  \n{r['url'] or '(no url available)'}")
             score = int(r.get("score", 0))
-            reason = r.get("reason", "")
-
-            st.markdown(f"**{i}. {title}**  \n{url or '(no url available)'}")
-            st.caption(f"Reason: {reason}" if reason else "Reason: (not available)")
             st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100 ({relevance_bucket(score)})")
 
         go_step3 = st.button("Continue to Step 3", type="primary", use_container_width=True)
         if go_step3:
             st.session_state["selected_urls"] = [r["url"] for r in ranked if r.get("url")]
             st.session_state["step"] = 3
-            log_event("step2_to_step3_auto", {"selected_count": len(st.session_state["selected_urls"])})
             st.rerun()
 
-    if st.session_state.get("confidence") in ["low", "medium"]:
-        st.warning("I’m not fully confident the pages match what you mean. Help me narrow it down")
+    if st.session_state.get("confidence") == "low":
+        st.warning("I’m not confident the pages fully match what you mean. Help me narrow it down")
 
         if st.session_state.get("need_questions"):
             st.markdown("**Quick questions (so I don’t pull the wrong pages):**")
@@ -774,13 +720,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 st.session_state["ranked"] = ranked2
                 st.session_state["confidence"] = confidence_from_scores(ranked2)
 
-                log_event("step2_retry_rank", {
-                    "query": st.session_state["final_query"],
-                    "confidence": st.session_state["confidence"],
-                    "scores": [{"title": r["title"], "score": r["score"]} for r in ranked2]
-                })
-
-                if st.session_state["confidence"] in ["low", "medium"]:
+                if st.session_state["confidence"] == "low":
                     st.session_state["show_keyword_picker"] = True
                     qs, kws = generate_clarifying_questions(st.session_state["final_query"], ranked2)
                     st.session_state["need_questions"] = "\n".join([f"- {q}" for q in qs])
@@ -847,14 +787,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
 
                     st.session_state["docs"] = docs_pool3
                     st.session_state["ranked"] = ranked3
-                    st.session_state["confidence"] = "low"  # keep transparent in forced mode
-
-                    log_event("step2_forced_rank", {
-                        "query": st.session_state["forced_query"],
-                        "confidence": st.session_state["confidence"],
-                        "scores": [{"title": r["title"], "score": r["score"]} for r in ranked3]
-                    })
-
+                    st.session_state["confidence"] = "low"
                     st.rerun()
 
                 except Exception as e:
@@ -867,32 +800,27 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 st.markdown(f"**Forced topic used:** {st.session_state.get('forced_query','').strip()}")
 
                 ranked_forced = st.session_state.get("ranked", [])[:TOP_K]
-
-                forced_scores = [int(r.get("score", 0)) for r in ranked_forced]
+                forced_scores = [int(r.get("score", 0)) for r in ranked_forced if r.get("url") or r.get("title")]
                 if forced_scores and max(forced_scores) < RELATED_MIN:
                     st.info(
-                        "These are weak matches. This app searches Wikipedia only, so this is the best available set. "
-                        "Please choose the pages closest to your intent or try different forced keywords"
+                        "These results are weak matches. This is the best I can retrieve because this app searches Wikipedia only. "
+                        "Please pick pages that feel closest to your intent, or try different forced keywords"
                     )
 
                 url_options = []
                 for i, r in enumerate(ranked_forced, 1):
-                    title = r.get("title", "Wikipedia page")
-                    url = r.get("url", "")
-                    score = int(r.get("score", 0))
-                    reason = r.get("reason", "")
-
-                    label = f"{i}. {title} ({score}/100 • {relevance_bucket(score)})"
+                    title, url, score = r.get("title","Wikipedia page"), r.get("url",""), int(r.get("score", 0))
+                    label = f"{i}. {title} ({score}/100)"
                     url_options.append((label, url))
                     st.markdown(f"**{label}**  \n{url or '(no url available)'}")
-                    st.caption(f"Reason: {reason}" if reason else "Reason: (not available)")
-                    st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100")
+                    st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100 ({relevance_bucket(score)})")
 
                 labels = [lbl for (lbl, _) in url_options]
+                default_labels = labels[:]
                 chosen_labels = st.multiselect(
                     "Select pages to carry into Step 3 (recommended: pick 3–5)",
                     options=labels,
-                    default=safe_list_default(labels, labels),
+                    default=safe_list_default(labels, default_labels),
                     key="forced_select_pages",
                 )
                 chosen_urls = [u for (lbl, u) in url_options if (lbl in chosen_labels and u)]
@@ -901,7 +829,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 go_step3b = st.button("Continue to Step 3", type="primary", use_container_width=True)
                 if go_step3b:
                     st.session_state["step"] = 3
-                    log_event("step2_to_step3_manual", {"selected_count": len(st.session_state["selected_urls"])})
                     st.rerun()
 
 # -----------------------------
@@ -923,12 +850,12 @@ if st.session_state.get("step", 1) >= 3:
 
     st.caption(
         f"How to choose pages: {STRONG_MATCH_MIN}–100 = Strong match, "
-        f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{WEAK_MAX} = Weak match. "
+        f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match. "
         "If scores are low, pick pages that best match your meaning"
     )
     st.markdown(f"**Report topic:** {topic_for_report}")
 
-    # Selection UI first (as you requested)
+    # Selection UI first (UNCHANGED)
     url_options = []
     for i, r in enumerate(ranked_all, 1):
         title = r.get("title", "Wikipedia page")
@@ -955,38 +882,34 @@ if st.session_state.get("step", 1) >= 3:
         st.warning("Please select at least 1 page (with a valid URL) to generate the report")
         st.stop()
 
-    # Then show explanations (must match current topic + current ranked list)
-    with st.expander("See brief explanation for each selected page (helps you decide)"):
-        selected_set = set(chosen_urls_step3)
-        selected_ranked = [r for r in ranked_all if r.get("url") in selected_set]
-        explanations = llm_explain_pages(topic_for_report, selected_ranked)
+    # ✅ CHANGE YOU ASKED: explanation dropdown comes AFTER selection and must match CURRENT keywords/topic
+    with st.expander("Brief explanation of the pages you selected (to help you double-check)"):
+        try:
+            expl = llm_explain_pages_for_choice(topic_for_report, ranked_all, chosen_urls_step3)
+        except Exception:
+            expl = []
 
-        for i, r in enumerate(selected_ranked, 1):
-            title = r.get("title", "Wikipedia page")
-            url = r.get("url", "")
-            score = int(r.get("score", 0))
-            reason = r.get("reason", "")
-            explain = explanations[i-1] if i-1 < len(explanations) else ""
+        if not expl:
+            st.info("No explanations available. Try selecting pages that have valid URLs")
+        else:
+            for i, e in enumerate(expl, 1):
+                title = e.get("title", "Wikipedia page")
+                url = e.get("url", "")
+                score = int(e.get("score", 0))
+                explain = e.get("explain", "")
+                st.markdown(f"**{i}. {title}**")
+                st.caption(f"Relevance: {score}/100 • {relevance_bucket(score)}")
+                if explain:
+                    st.markdown(f"- {explain}")
+                st.markdown(f"{url}")
+                st.divider()
 
-            st.markdown(f"**{i}. {title}**")
-            st.caption(f"Relevance: {score}/100 • {relevance_bucket(score)}")
-            if reason:
-                st.markdown(f"- **Judge reason:** {reason}")
-            if explain:
-                st.markdown(f"- **Selection hint:** {explain}")
-            st.markdown(f"{url or '(no url available)'}")
-            st.divider()
-
-    # Build docs_to_use
+    # docs to use
     url_set = set(chosen_urls_step3)
     docs_to_use = []
     for r in ranked_all:
         if r.get("url") in url_set and r.get("doc") is not None:
             docs_to_use.append(r["doc"])
-
-    if not docs_to_use:
-        st.error("None of the selected pages have usable Wikipedia content. Please select different pages")
-        st.stop()
 
     gen_col1, gen_col2 = st.columns(2)
     with gen_col1:
@@ -1012,7 +935,6 @@ if st.session_state.get("step", 1) >= 3:
             with st.spinner("Writing report..."):
                 report = write_report_from_docs(topic_for_report, docs_to_use)
             st.session_state["report"] = report
-            log_event("step3_generate", {"topic": topic_for_report, "selected_urls": chosen_urls_step3})
             st.rerun()
         except Exception as e:
             st.session_state["last_error"] = "Step 3 report generation failed. Try regenerate or change selected pages"
@@ -1033,17 +955,3 @@ if st.session_state.get("step", 1) >= 3:
             use_container_width=True,
             key="download_report_txt",
         )
-
-# Optional: small evaluation/log export (helps you justify methodology for distinction)
-with st.sidebar.expander("Method log (optional)"):
-    st.caption("This helps show your methodology (queries → scores → selections) for marking")
-    if st.session_state.get("log_events"):
-        st.download_button(
-            "Download log (JSON)",
-            data=json.dumps(st.session_state["log_events"], ensure_ascii=False, indent=2),
-            file_name="method_log.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-    else:
-        st.caption("No log events yet")
