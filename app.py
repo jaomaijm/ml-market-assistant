@@ -587,7 +587,7 @@ stepper()
 # -----------------------------
 # STEP 1
 # -----------------------------
-st.subheader("Step 1: Input")
+st.subheader("Step 1: Tell me your interested topic")
 industry_input = st.text_input(
     "Industry",
     value=st.session_state.get("industry", ""),
@@ -651,7 +651,7 @@ if step1_go:
 # -----------------------------
 # STEP 2
 # -----------------------------
-st.subheader("Step 2: Find 5 relevant Wikipedia URLs")
+st.subheader("Step 2: Finding and scoring pages")
 
 if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", ""):
     st.markdown(f"**Current topic:** {st.session_state.get('final_query','').strip() or st.session_state.get('industry','').strip()}")
@@ -862,7 +862,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
 # -----------------------------
 # STEP 3
 # -----------------------------
-st.subheader("Step 3: Report (under 500 words)")
+st.subheader("Step 3: Writing your report)")
 
 if st.session_state.get("step", 1) >= 3:
     topic_for_report = (
