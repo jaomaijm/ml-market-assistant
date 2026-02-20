@@ -559,7 +559,7 @@ stepper()
 # -----------------------------
 # STEP 1
 # -----------------------------
-st.subheader("Step 1: Input")
+st.subheader("Step 1: Let me know the industry you are interested in")
 industry_input = st.text_input(
     "Industry",
     value=st.session_state.get("industry", ""),
@@ -623,7 +623,7 @@ if step1_go:
 # -----------------------------
 # STEP 2
 # -----------------------------
-st.subheader("Step 2: Find 5 relevant Wikipedia URLs")
+st.subheader("Step 2: Searching for 5 relevant Wikipedia URLs!")
 
 if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", ""):
     st.markdown(f"**Current topic:** {st.session_state.get('final_query','').strip() or st.session_state.get('industry','').strip()}")
@@ -699,7 +699,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
         with col1:
             retry_with_context = st.button("Retry search with clarification", type="primary", use_container_width=True)
         with col2:
-            force_keywords = st.button("Still unsure → show forced keyword options", use_container_width=True)
+            force_keywords = st.button("Show forced keyword options", use_container_width=True)
 
         if retry_with_context:
             st.session_state["keyword_pick"] = pick
@@ -739,7 +739,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
 
         if st.session_state.get("show_keyword_picker"):
             st.divider()
-            st.subheader("Forced keywords (Round 2)")
+            st.subheader("One more verification to make sure I retrieve the right one(s)!")
             st.caption("Click suggestions, type your own, or do both")
 
             suggestions2 = st.session_state.get("suggested_keywords", [])
@@ -834,7 +834,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
 # -----------------------------
 # STEP 3
 # -----------------------------
-st.subheader("Step 3: Report (under 500 words)")
+st.subheader("Step 3: Industry report")
 
 if st.session_state.get("step", 1) >= 3:
     topic_for_report = (
