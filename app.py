@@ -82,12 +82,23 @@ RELATED_MIN = 60
 # Helpers
 # =========================================================
 def stepper():
-    cols = st.columns(3)
-    s = st.session_state.get("step", 1)
+    # Better UX: compact progress + tabs-like labels
+    s = int(st.session_state.get("step", 1))
+    progress_value = {1: 1/3, 2: 2/3, 3: 1.0}.get(s, 1/3)
 
-    cols[0].markdown(f"**{'➡️' if s == 1 else '✅'} Step 1: Input**")
-    cols[1].markdown(f"**{'➡️' if s == 2 else ('✅' if s > 2 else '⬜')} Step 2: URLs**")
-    cols[2].markdown(f"**{'➡️' if s == 3 else '⬜'} Step 3: Report**")
+    st.progress(progress_value, text=f"Progress: Step {s} of 3")
+
+    cols = st.columns(3)
+    labels = ["Input", "URLs", "Report"]
+
+    for i, label in enumerate(labels, start=1):
+        if i < s:
+            cols[i-1].markdown(f"✅ **Step {i}**  \n{label}")
+        elif i == s:
+            cols[i-1].markdown(f"🟦 **Step {i}**  \n{label}")
+        else:
+            cols[i-1].markdown(f"⬜ **Step {i}**  \n{label}")
+
     st.divider()
 
 def looks_like_input(text: str) -> bool:
@@ -669,7 +680,6 @@ if st.session_state.get("step", 1) >= 3:
         "If you see low scores, pick pages that still describe your market angle best"
     )
 
-    # Build options with reasons (expanders)
     url_options = []
     url_to_reason = {}
     for i, r in enumerate(display_list, 1):
@@ -682,7 +692,6 @@ if st.session_state.get("step", 1) >= 3:
         snippet = (getattr(r.get("doc"), "page_content", "") or "")
         url_to_reason[url] = explain_choice(topic_for_report, title, snippet, score)
 
-    # Default selection: keep Step 2 selection if available
     prev_selected = st.session_state.get("selected_urls", [])
     default_labels = [lbl for (lbl, u) in url_options if (u in prev_selected)] if prev_selected else [lbl for (lbl, _) in url_options]
 
@@ -705,7 +714,6 @@ if st.session_state.get("step", 1) >= 3:
                 if url in chosen_urls_step3:
                     st.markdown(f"- **{lbl}**  \n  {url_to_reason.get(url, '')}")
 
-    # Determine docs to use based on selection
     if not chosen_urls_step3:
         st.warning("Please select at least 1 page to generate the report")
         st.stop()
