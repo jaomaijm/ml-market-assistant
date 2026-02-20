@@ -121,30 +121,19 @@ def looks_like_input(text: str) -> bool:
         return False
     return True
 
-# -------- NEW: detect gibberish / incomplete inputs (asked by you) --------
 def is_probably_gibberish_or_incomplete(text: str):
-    """
-    Returns (bad: bool, reason: str)
-    - gibberish like "ghdbfv"
-    - incomplete/fragment like "electr"
-    Heuristics only (cheap, fast). We also do a Wikipedia-retrieval sanity check below.
-    """
     t = (text or "").strip()
     low = t.lower()
 
-    # Too short to be meaningful
     if len(low) < 4:
         return True, "Too short. Please enter a full industry/topic (at least 4 characters)"
 
-    # Mostly consonants (e.g., ghdbfv) => likely nonsense
     letters = re.findall(r"[a-z]", low)
     if len(letters) >= 5:
         vowels = sum(ch in "aeiou" for ch in letters)
         if vowels / max(1, len(letters)) < 0.25:
             return True, "Looks like random letters. Please type a real word or phrase (e.g., 'electric vehicles')"
 
-    # Single long token that is not spaced and ends mid-word often
-    # (common case: "electr", "cosmet", "automot")
     if " " not in low and len(low) <= 6:
         if low.endswith(("r", "t", "c", "m", "v", "n", "l")) and not low.endswith(("ing", "ion", "ics")):
             return True, "Looks like an incomplete word. Please type the full industry name (e.g., 'electricity' or 'electric vehicles')"
@@ -174,37 +163,25 @@ def retrieve_wikipedia_docs(query: str, top_k: int = 12):
     retriever = WikipediaRetriever(top_k_results=top_k, lang=LANG)
     return retriever.invoke(query)
 
-# -------- NEW: sanity-check step 1 input via Wikipedia results --------
-def wiki_sanity_check(industry_text: str) -> tuple[bool, str, list]:
-    """
-    Uses WikipediaRetriever to decide if the input has meaning.
-    Returns (ok, message, docs_preview)
-    """
+def wiki_sanity_check(industry_text: str):
     q = _normalize_query(industry_text)
     try:
         docs = retrieve_wikipedia_docs(q, top_k=5)
     except Exception:
         docs = []
 
-    # If nothing retrieved, likely nonsense or too vague
     if not docs:
         return False, "I couldn't find any Wikipedia pages for that. Please re-type with a real industry/topic", []
 
-    # If we got docs but titles look irrelevant (e.g., weird disambiguation / random), we treat as not ok
     titles = [extract_title(d).lower() for d in docs if d is not None]
-    joined_titles = " | ".join(titles)
-
-    # If too many titles are empty or generic
     if len(titles) < 2:
         return False, "I found too little to confirm what you mean. Please type a clearer industry/topic", docs
 
-    # If query is a short fragment and doesn't appear in any title, treat as incomplete
     low = q.lower()
     if " " not in low and len(low) <= 6:
         if not any(low in t for t in titles):
             return False, "This looks like a partial word. Please type the full industry name (example: 'electric vehicles')", docs
 
-    # Otherwise OK
     return True, "", docs
 
 def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> list:
@@ -256,6 +233,71 @@ def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> l
         add_docs(docs)
 
     return candidates
+
+# ---------- NEW: brief explanation per URL (used in dropdown + selection UI) ----------
+def llm_explain_pages(topic: str, ranked_list: list) -> list:
+    """
+    Input: ranked_list = [{title,url,score,...}, ...] length <=5
+    Output: list of brief explanations aligned by index
+    """
+    pages = []
+    for r in ranked_list[:TOP_K]:
+        pages.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "score": int(r.get("score", 0)),
+        })
+
+    prompt = f"""
+You are helping a user choose Wikipedia pages for a market research report.
+
+User topic:
+{topic}
+
+Pages (JSON):
+{json.dumps(pages, ensure_ascii=False)}
+
+Task:
+For each page, write ONE short explanation (max 18 words):
+- what the page is about (topic/category)
+- why it may help (or why it may be weak) for the user topic
+
+Return ONLY valid JSON:
+{{
+  "explanations": [
+    {{"title":"...","url":"...","explain":"..."}},
+    ...
+  ]
+}}
+Rules:
+- Keep explanations short and plain
+- Do not invent facts beyond what title suggests
+""".strip()
+
+    out = []
+    try:
+        raw = llm.invoke(prompt).content.strip()
+        data = safe_json_loads(raw)
+        if data and isinstance(data.get("explanations", None), list):
+            out = data["explanations"]
+    except Exception:
+        out = []
+
+    # Map back to given order (fallback)
+    exp_map = {}
+    for e in out:
+        exp_map[(str(e.get("title","")), str(e.get("url","")))] = str(e.get("explain","")).strip()
+
+    explanations = []
+    for r in ranked_list[:TOP_K]:
+        key = (r.get("title",""), r.get("url",""))
+        explain = exp_map.get(key, "")
+        if not explain:
+            # simple fallback
+            explain = "General reference page; may be broad relative to your market topic"
+        explanations.append(explain)
+
+    return explanations
 
 def llm_rank_docs(industry_query: str, docs):
     items = []
@@ -536,7 +578,6 @@ if step1_go:
         st.warning("Please enter an industry/topic first")
         st.stop()
 
-    # NEW: step 1 validation for gibberish/incomplete BEFORE going to step 2
     bad, reason = is_probably_gibberish_or_incomplete(industry_input)
     if bad:
         st.warning(reason)
@@ -750,6 +791,15 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 st.markdown(f"**Forced topic used:** {st.session_state.get('forced_query','').strip()}")
 
                 ranked_forced = st.session_state.get("ranked", [])[:TOP_K]
+
+                # NEW: if weak overall, be transparent about Wikipedia-only limitation
+                forced_scores = [int(r.get("score", 0)) for r in ranked_forced if r.get("url") or r.get("title")]
+                if forced_scores and max(forced_scores) < RELATED_MIN:
+                    st.info(
+                        "These results are weak matches. This is the best I can retrieve because this app searches Wikipedia only. "
+                        "Please pick the pages that feel closest to your intent, or try different forced keywords"
+                    )
+
                 url_options = []
                 for i, r in enumerate(ranked_forced, 1):
                     title, url, score = r.get("title","Wikipedia page"), r.get("url",""), int(r.get("score", 0))
@@ -794,10 +844,30 @@ if st.session_state.get("step", 1) >= 3:
     st.caption(
         f"How to choose pages: {STRONG_MATCH_MIN}–100 = Strong match, "
         f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match. "
-        "If scores are low, choose pages that best match your exact meaning"
+        "If scores are low, pick pages that best match your meaning"
     )
     st.markdown(f"**Report topic:** {topic_for_report}")
 
+    # NEW: explain each URL topic briefly (dropdown)
+    with st.expander("See brief explanation for each page (to help you choose)"):
+        try:
+            explanations = llm_explain_pages(topic_for_report, ranked_all)
+        except Exception:
+            explanations = [""] * len(ranked_all)
+
+        for i, r in enumerate(ranked_all, 1):
+            title = r.get("title", "Wikipedia page")
+            url = r.get("url", "")
+            score = int(r.get("score", 0))
+            explain = explanations[i-1] if i-1 < len(explanations) else ""
+            st.markdown(f"**{i}. {title}**")
+            st.caption(f"Relevance: {score}/100 • {relevance_bucket(score)}")
+            if explain:
+                st.markdown(f"- {explain}")
+            st.markdown(f"{url or '(no url available)'}")
+            st.divider()
+
+    # Selection UI
     url_options = []
     for i, r in enumerate(ranked_all, 1):
         title = r.get("title", "Wikipedia page")
@@ -811,7 +881,7 @@ if st.session_state.get("step", 1) >= 3:
     default_labels = [lbl for (lbl, u) in url_options if (u and u in carried)] if carried else [lbl for (lbl, u) in url_options if u]
 
     chosen_labels_step3 = st.multiselect(
-        "Select pages (3–5 recommended)",
+        "Select pages for the report (3–5 recommended)",
         options=option_labels,
         default=safe_list_default(option_labels, default_labels),
         key="step3_picker",
