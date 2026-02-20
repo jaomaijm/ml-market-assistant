@@ -5,18 +5,14 @@ from langchain_community.retrievers import WikipediaRetriever
 from langchain_openai import ChatOpenAI
 
 # =========================================================
-# SECTION A — PAGE SETUP (UI)
-# Marker note: app layout + high-level purpose
+# Page setup
 # =========================================================
 st.set_page_config(page_title="Market Research Assistant", page_icon="🔎", layout="wide")
 st.title("Market Research Assistant")
-st.caption(
-    "Give me a keyword. I’ll pull Wikipedia pages, score relevance using an LLM, and generate a structured market brief under 500 words"
-)
+st.caption("Hi! I'm your market research assistant. Give me your keyword, I will find 5 relevant Wikipedia URLs and generate a report")
 
 # =========================================================
-# SECTION B — SESSION STATE (prevents Streamlit errors)
-# Marker note: ensures multi-step flow is stable across reruns
+# Session state defaults (MUST come before any usage)
 # =========================================================
 defaults = {
     "step": 1,  # 1 -> 2 -> 3
@@ -43,8 +39,7 @@ for k, v in defaults.items():
         st.session_state[k] = v
 
 # =========================================================
-# SECTION C — SIDEBAR: API KEY + MODEL + RESET
-# Marker note: key used only in session, not stored
+# Sidebar: API key + (single-option) LLM dropdown + reset
 # =========================================================
 st.sidebar.header("API Key & LLM")
 
@@ -75,8 +70,7 @@ if not api_key_session:
     st.stop()
 
 # =========================================================
-# SECTION D — LLM INIT (guard)
-# Marker note: LLM is used for relevance scoring + generating report text
+# LLM init (guard)
 # =========================================================
 MODEL_NAME = "gpt-4.1-mini"
 try:
@@ -88,11 +82,12 @@ except Exception as e:
 
 TOP_K = 5
 LANG = "en"
+
 STRONG_MATCH_MIN = 70
 RELATED_MIN = 60
 
 # =========================================================
-# SECTION E — SAFE UTILITIES (reduce errors)
+# Safe utilities
 # =========================================================
 def safe_json_loads(raw: str):
     try:
@@ -110,23 +105,16 @@ def safe_rerun_reset_error():
     st.rerun()
 
 # =========================================================
-# SECTION F — STEP PROGRESS BAR (interactive wording)
-# Marker note: only UI text changed, logic unchanged
+# Helpers
 # =========================================================
 def stepper():
     s = int(st.session_state.get("step", 1))
     progress_value = {1: 1/3, 2: 2/3, 3: 1.0}.get(s, 1/3)
-
-    step_text = {
-        1: "Step 1 of 3 • Pick your research topic",
-        2: "Step 2 of 3 • Hunting Wikipedia sources + scoring relevance",
-        3: "Step 3 of 3 • Building your market brief"
-    }.get(s, "Progress")
-
-    st.progress(progress_value, text=step_text)
+    st.progress(progress_value, text=f"Progress: Step {s} of 3")
     st.divider()
 
 def looks_like_input(text: str) -> bool:
+    # ✅ FIX: accept meaningful 2–3 char inputs (AI, EV, UK, SEO, CRM, etc.)
     t = (text or "").strip()
     if len(t) < 2:
         return False
@@ -134,6 +122,12 @@ def looks_like_input(text: str) -> bool:
         return False
     return True
 
+# -----------------------------
+# ✅ FIX: stop over-blocking short meaningful words
+# - remove hard ">=4 chars" rule
+# - allow acronyms (2–4 uppercase letters), common short tokens, and common country codes
+# - use Wikipedia sanity check as the real gate for short inputs
+# -----------------------------
 COMMON_SHORT_OK = {
     "ai", "ml", "nlp", "ev", "vr", "ar", "ux", "ui", "seo", "sem", "crm", "erp", "saas",
     "iot", "fintech", "insurtech", "edtech", "biotech",
@@ -147,29 +141,42 @@ def is_short_but_allowed(text: str) -> bool:
     low = t.lower()
     if low in COMMON_SHORT_OK:
         return True
+    # Acronyms: 2–5 letters, mostly uppercase (e.g., GDP, ESG, FMCG)
     if re.fullmatch(r"[A-Z]{2,5}", t):
         return True
+    # Alpha+digit short tokens (e.g., 3G, 4G, 5G)
     if re.fullmatch(r"[A-Za-z]{1,3}\d{1,2}", t):
         return True
     return False
 
 def is_probably_gibberish_or_incomplete(text: str):
+    """
+    ✅ FIX: Only block truly suspicious input.
+    Short meaningful terms are allowed; Wikipedia sanity check will validate relevance.
+    """
     t = (text or "").strip()
     low = t.lower()
 
     if len(low) < 2:
         return True, "Too short. Please type a real industry/topic (at least 2 characters)"
 
+    # If it's short (<=3) but allowed acronym/token, don't flag as gibberish
     if len(low) <= 3 and is_short_but_allowed(t):
         return False, ""
 
+    # If it's very short (2–3) and NOT allowed, don't hard-block; just warn via sanity check later
+    # (so user can still try "tea", "pet", etc.)
+    # We only hard-block if it looks like random characters.
     letters = re.findall(r"[a-z]", low)
     if len(letters) >= 5:
         vowels = sum(ch in "aeiou" for ch in letters)
         if vowels / max(1, len(letters)) < 0.2:
             return True, "Looks like random letters. Please type a real word or phrase (e.g., 'electric vehicles')"
 
+    # Incomplete single-word heuristic:
+    # Only apply when length >= 5 (so 'pet', 'tea', 'oil' are not punished)
     if " " not in low and len(low) >= 5:
+        # likely truncated stems
         if low.endswith(("r", "t", "c", "m", "v", "n", "l")) and not low.endswith(("ing", "ion", "ics", "tech")):
             return True, "Looks like an incomplete word. Please type the full industry name (e.g., 'electric vehicles')"
 
@@ -199,6 +206,11 @@ def retrieve_wikipedia_docs(query: str, top_k: int = 12):
     return retriever.invoke(query)
 
 def wiki_sanity_check(industry_text: str):
+    """
+    ✅ FIX: treat short inputs fairly:
+    - If user input is short but Wikipedia returns pages, accept it
+    - If Wikipedia returns nothing, ask user to clarify instead of calling it random
+    """
     q = _normalize_query(industry_text)
     try:
         docs = retrieve_wikipedia_docs(q, top_k=5)
@@ -213,7 +225,10 @@ def wiki_sanity_check(industry_text: str):
         return False, "I found too little to confirm what you mean. Please add a bit more context (country, segment, B2B/B2C)", docs
 
     low = q.lower()
+
+    # Only apply partial-word check for short single-words that are NOT known acronyms/tokens
     if " " not in low and len(low) <= 6 and not is_short_but_allowed(q):
+        # If none of the titles contain the token, it might be a typo or partial
         if not any(low in t for t in titles):
             return False, "This might be a typo or partial word. Please re-type or add context (e.g., 'EV market', 'pet care')", docs
 
@@ -557,7 +572,7 @@ Do NOT be vague.
     return explanations
 
 # =========================================================
-# SECTION G — GLOBAL ERROR BANNER (non-blocking)
+# Global error banner
 # =========================================================
 if st.session_state.get("last_error"):
     st.error(st.session_state["last_error"])
@@ -565,26 +580,24 @@ if st.session_state.get("last_error"):
         safe_rerun_reset_error()
 
 # =========================================================
-# SECTION H — MAIN UI FLOW (Step 1 -> Step 2 -> Step 3)
+# UI
 # =========================================================
 stepper()
 
 # -----------------------------
-# STEP 1 — Interactive label
+# STEP 1
 # -----------------------------
-st.subheader("🧭 Step 1 — What topic are you researching today")
-st.caption("Tip: short keywords are ok (EV, AI, ESG). You can add context later if needed")
-
+st.subheader("Step 1: Input")
 industry_input = st.text_input(
     "Industry",
     value=st.session_state.get("industry", ""),
-    placeholder="Examples: EV, AI, ESG investing, pet companionship market, cosmetics Vietnam",
+    placeholder="Example: EV, AI, pet companionship market, cosmetics in Vietnam",
     label_visibility="collapsed",
 )
 
 col_a, col_b = st.columns(2)
 with col_a:
-    step1_go = st.button("Let’s find sources →", type="primary", use_container_width=True)
+    step1_go = st.button("Continue to Step 2", type="primary", use_container_width=True)
 with col_b:
     clear_all = st.button("Clear results", use_container_width=True)
 
@@ -605,7 +618,7 @@ if step1_go:
     bad, reason = is_probably_gibberish_or_incomplete(industry_input)
     if bad:
         st.warning(reason)
-        st.info("Examples: 'EV', 'AI', 'ESG', 'pet companionship market', 'cosmetics in Vietnam'")
+        st.info("Examples: 'EV', 'AI', 'pet companionship market', 'cosmetics in Vietnam'")
         st.stop()
 
     ok, msg, preview_docs = wiki_sanity_check(industry_input)
@@ -636,9 +649,9 @@ if step1_go:
     st.rerun()
 
 # -----------------------------
-# STEP 2 — Interactive label
+# STEP 2
 # -----------------------------
-st.subheader("📚 Step 2 — I’ll fetch 5 Wikipedia sources and score relevance")
+st.subheader("Step 2: Find 5 relevant Wikipedia URLs")
 
 if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", ""):
     st.markdown(f"**Current topic:** {st.session_state.get('final_query','').strip() or st.session_state.get('industry','').strip()}")
@@ -647,7 +660,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
         f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match"
     )
 
-    # ---- (Everything below is your original Step 2 logic unchanged) ----
     if not st.session_state.get("ranked"):
         try:
             with st.spinner("Searching Wikipedia and ranking results..."):
@@ -681,7 +693,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             score = int(r.get("score", 0))
             st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100 ({relevance_bucket(score)})")
 
-        go_step3 = st.button("Build my report →", type="primary", use_container_width=True)
+        go_step3 = st.button("Continue to Step 3", type="primary", use_container_width=True)
         if go_step3:
             st.session_state["selected_urls"] = [r["url"] for r in ranked if r.get("url")]
             st.session_state["step"] = 3
@@ -713,7 +725,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
 
         col1, col2 = st.columns(2)
         with col1:
-            retry_with_context = st.button("Retry with my clarification", type="primary", use_container_width=True)
+            retry_with_context = st.button("Retry search with clarification", type="primary", use_container_width=True)
         with col2:
             force_keywords = st.button("Still unsure → show forced keyword options", use_container_width=True)
 
@@ -842,15 +854,15 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 chosen_urls = [u for (lbl, u) in url_options if (lbl in chosen_labels and u)]
                 st.session_state["selected_urls"] = chosen_urls
 
-                go_step3b = st.button("Build my report →", type="primary", use_container_width=True)
+                go_step3b = st.button("Continue to Step 3", type="primary", use_container_width=True)
                 if go_step3b:
                     st.session_state["step"] = 3
                     st.rerun()
 
 # -----------------------------
-# STEP 3 — Interactive label
+# STEP 3
 # -----------------------------
-st.subheader("📝 Step 3 — Choose sources and generate your brief (under 500 words)")
+st.subheader("Step 3: Report (under 500 words)")
 
 if st.session_state.get("step", 1) >= 3:
     topic_for_report = (
@@ -865,8 +877,9 @@ if st.session_state.get("step", 1) >= 3:
         st.stop()
 
     st.caption(
-        f"Selection guide: {STRONG_MATCH_MIN}–100 = Strong match, "
-        f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match"
+        f"How to choose pages: {STRONG_MATCH_MIN}–100 = Strong match, "
+        f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match. "
+        "If scores are low, pick pages that best match your meaning"
     )
     st.markdown(f"**Report topic:** {topic_for_report}")
 
@@ -883,7 +896,7 @@ if st.session_state.get("step", 1) >= 3:
     default_labels = [lbl for (lbl, u) in url_options if (u and u in carried)] if carried else [lbl for (lbl, u) in url_options if u]
 
     chosen_labels_step3 = st.multiselect(
-        "Pick the pages you want the report to be based on (3–5 recommended)",
+        "Select pages for the report (3–5 recommended)",
         options=option_labels,
         default=safe_list_default(option_labels, default_labels),
         key="step3_picker",
@@ -926,7 +939,7 @@ if st.session_state.get("step", 1) >= 3:
     gen_col1, gen_col2 = st.columns(2)
     with gen_col1:
         gen_report = st.button(
-            "Generate my brief",
+            "Generate report",
             type="primary",
             use_container_width=True,
             disabled=bool(st.session_state.get("report")),
@@ -954,7 +967,7 @@ if st.session_state.get("step", 1) >= 3:
             st.stop()
 
     if st.session_state.get("report"):
-        st.markdown("### Your market brief")
+        st.markdown("### Report")
         st.markdown(st.session_state["report"])
         wc = word_count(st.session_state["report"])
         st.caption(f"Word count: {wc} / 500")
