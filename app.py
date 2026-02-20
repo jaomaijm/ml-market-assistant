@@ -96,7 +96,6 @@ def safe_json_loads(raw: str):
         return None
 
 def safe_list_default(options, default_list):
-    """Prevents StreamlitAPIException when default contains values not in options"""
     opt_set = set(options or [])
     cleaned = [x for x in (default_list or []) if x in opt_set]
     return cleaned
@@ -122,6 +121,36 @@ def looks_like_input(text: str) -> bool:
         return False
     return True
 
+# -------- NEW: detect gibberish / incomplete inputs (asked by you) --------
+def is_probably_gibberish_or_incomplete(text: str):
+    """
+    Returns (bad: bool, reason: str)
+    - gibberish like "ghdbfv"
+    - incomplete/fragment like "electr"
+    Heuristics only (cheap, fast). We also do a Wikipedia-retrieval sanity check below.
+    """
+    t = (text or "").strip()
+    low = t.lower()
+
+    # Too short to be meaningful
+    if len(low) < 4:
+        return True, "Too short. Please enter a full industry/topic (at least 4 characters)"
+
+    # Mostly consonants (e.g., ghdbfv) => likely nonsense
+    letters = re.findall(r"[a-z]", low)
+    if len(letters) >= 5:
+        vowels = sum(ch in "aeiou" for ch in letters)
+        if vowels / max(1, len(letters)) < 0.25:
+            return True, "Looks like random letters. Please type a real word or phrase (e.g., 'electric vehicles')"
+
+    # Single long token that is not spaced and ends mid-word often
+    # (common case: "electr", "cosmet", "automot")
+    if " " not in low and len(low) <= 6:
+        if low.endswith(("r", "t", "c", "m", "v", "n", "l")) and not low.endswith(("ing", "ion", "ics")):
+            return True, "Looks like an incomplete word. Please type the full industry name (e.g., 'electricity' or 'electric vehicles')"
+
+    return False, ""
+
 def word_count(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text or ""))
 
@@ -142,9 +171,41 @@ def _strip_parentheses(q: str) -> str:
     return re.sub(r"\s*\([^)]*\)\s*", " ", (q or "")).strip()
 
 def retrieve_wikipedia_docs(query: str, top_k: int = 12):
-    # WikipediaRetriever can throw exceptions depending on connectivity / rate limits
     retriever = WikipediaRetriever(top_k_results=top_k, lang=LANG)
     return retriever.invoke(query)
+
+# -------- NEW: sanity-check step 1 input via Wikipedia results --------
+def wiki_sanity_check(industry_text: str) -> tuple[bool, str, list]:
+    """
+    Uses WikipediaRetriever to decide if the input has meaning.
+    Returns (ok, message, docs_preview)
+    """
+    q = _normalize_query(industry_text)
+    try:
+        docs = retrieve_wikipedia_docs(q, top_k=5)
+    except Exception:
+        docs = []
+
+    # If nothing retrieved, likely nonsense or too vague
+    if not docs:
+        return False, "I couldn't find any Wikipedia pages for that. Please re-type with a real industry/topic", []
+
+    # If we got docs but titles look irrelevant (e.g., weird disambiguation / random), we treat as not ok
+    titles = [extract_title(d).lower() for d in docs if d is not None]
+    joined_titles = " | ".join(titles)
+
+    # If too many titles are empty or generic
+    if len(titles) < 2:
+        return False, "I found too little to confirm what you mean. Please type a clearer industry/topic", docs
+
+    # If query is a short fragment and doesn't appear in any title, treat as incomplete
+    low = q.lower()
+    if " " not in low and len(low) <= 6:
+        if not any(low in t for t in titles):
+            return False, "This looks like a partial word. Please type the full industry name (example: 'electric vehicles')", docs
+
+    # Otherwise OK
+    return True, "", docs
 
 def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> list:
     primary_query = _normalize_query(primary_query)
@@ -178,7 +239,6 @@ def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> l
             f"{industry_fallback} market",
         ]
 
-    # Try multiple queries to reduce "only 4 docs" cases
     for q in query_variants:
         if len(candidates) >= TOP_K:
             break
@@ -188,7 +248,6 @@ def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> l
             docs = []
         add_docs(docs)
 
-    # Final fallback if still not enough
     if len(candidates) < TOP_K:
         try:
             docs = retrieve_wikipedia_docs("Industry", top_k=12)
@@ -245,7 +304,6 @@ Rules:
         scores = None
 
     if scores is None:
-        # Fail-safe: never crash, just use neutral scores
         scores = [{"title": it["title"], "url": it["url"], "score": 55} for it in items]
 
     score_map = {(s.get("title",""), s.get("url","")): int(s.get("score", 0)) for s in scores}
@@ -259,8 +317,6 @@ Rules:
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
 
-    # Ensure we ALWAYS have at least TOP_K items (padding with placeholders if needed)
-    # This avoids “only 4 urls” UX + avoids downstream index errors
     if len(ranked) < TOP_K:
         for i in range(TOP_K - len(ranked)):
             ranked.append({
@@ -364,7 +420,6 @@ Report:
     return " ".join(tokens[:limit])
 
 def write_report_from_docs(topic: str, docs):
-    # Protect against None docs (placeholders)
     clean_docs = [d for d in (docs or []) if d is not None]
     context = "\n\n".join([(getattr(d, "page_content", "") or "") for d in clean_docs]).strip()
 
@@ -481,6 +536,22 @@ if step1_go:
         st.warning("Please enter an industry/topic first")
         st.stop()
 
+    # NEW: step 1 validation for gibberish/incomplete BEFORE going to step 2
+    bad, reason = is_probably_gibberish_or_incomplete(industry_input)
+    if bad:
+        st.warning(reason)
+        st.info("Examples you can try: 'electric vehicles', 'pet companionship market', 'cosmetics in Vietnam'")
+        st.stop()
+
+    ok, msg, preview_docs = wiki_sanity_check(industry_input)
+    if not ok:
+        st.warning(msg)
+        if preview_docs:
+            st.markdown("I found these Wikipedia pages, but they don't clearly match what you typed. Try re-typing your topic")
+            for d in preview_docs[:5]:
+                st.markdown(f"- {extract_title(d)}")
+        st.stop()
+
     st.session_state["industry"] = industry_input.strip()
     st.session_state["clarification"] = ""
     st.session_state["final_query"] = build_query(st.session_state["industry"], "")
@@ -511,7 +582,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
         f"{RELATED_MIN}–{STRONG_MATCH_MIN-1} = Related, 0–{RELATED_MIN-1} = Weak match"
     )
 
-    # First attempt (auto)
     if not st.session_state.get("ranked"):
         try:
             with st.spinner("Searching Wikipedia and ranking results..."):
@@ -533,12 +603,10 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
         except Exception as e:
             st.session_state["last_error"] = "Step 2 failed while searching/ranking. Please retry"
             st.code(str(e))
-            # Keep user on step 2 without crashing
             st.stop()
 
     ranked = st.session_state.get("ranked", [])[:TOP_K]
 
-    # Path 1: confident
     if st.session_state.get("confidence") == "high":
         st.success("I’m confident these pages match your topic. Here are the top results with relevance scores")
 
@@ -553,7 +621,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             st.session_state["step"] = 3
             st.rerun()
 
-    # Path 2: not confident
     if st.session_state.get("confidence") == "low":
         st.warning("I’m not confident the pages fully match what you mean. Help me narrow it down")
 
@@ -563,7 +630,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
 
         st.markdown("**Optional: click a suggestion or type your own clarification**")
         suggestions = st.session_state.get("suggested_keywords", [])
-        # Filter defaults to prevent StreamlitAPIException
         default_pick = safe_list_default(suggestions, st.session_state.get("keyword_pick", []))
 
         pick = st.multiselect(
@@ -621,7 +687,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             st.session_state["show_keyword_picker"] = True
             st.rerun()
 
-        # Forced keywords (Round 2)
         if st.session_state.get("show_keyword_picker"):
             st.divider()
             st.subheader("Forced keywords (Round 2)")
@@ -694,7 +759,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                     st.progress(min(max(score, 0), 100) / 100.0, text=f"Relevance: {score}/100 ({relevance_bucket(score)})")
 
                 labels = [lbl for (lbl, _) in url_options]
-                default_labels = labels[:]  # choose all by default
+                default_labels = labels[:]
                 chosen_labels = st.multiselect(
                     "Select pages to carry into Step 3 (recommended: pick 3–5)",
                     options=labels,
@@ -742,7 +807,6 @@ if st.session_state.get("step", 1) >= 3:
         url_options.append((label, url))
 
     option_labels = [lbl for (lbl, _) in url_options]
-    # Default selection: use what user carried from step2 if possible else all valid urls
     carried = st.session_state.get("selected_urls", [])
     default_labels = [lbl for (lbl, u) in url_options if (u and u in carried)] if carried else [lbl for (lbl, u) in url_options if u]
 
@@ -760,7 +824,6 @@ if st.session_state.get("step", 1) >= 3:
         st.warning("Please select at least 1 page (with a valid URL) to generate the report")
         st.stop()
 
-    # Map selected urls to docs safely (ignore placeholder docs)
     url_set = set(chosen_urls_step3)
     docs_to_use = []
     for r in ranked_all:
