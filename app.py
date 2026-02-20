@@ -87,7 +87,7 @@ STRONG_MATCH_MIN = 70
 RELATED_MIN = 60
 
 # =========================================================
-# Safe utilities to prevent common Streamlit / parsing errors
+# Safe utilities
 # =========================================================
 def safe_json_loads(raw: str):
     try:
@@ -136,7 +136,7 @@ def is_probably_gibberish_or_incomplete(text: str):
 
     if " " not in low and len(low) <= 6:
         if low.endswith(("r", "t", "c", "m", "v", "n", "l")) and not low.endswith(("ing", "ion", "ics")):
-            return True, "Looks like an incomplete word. Please type the full industry name (e.g., 'electricity' or 'electric vehicles')"
+            return True, "Looks like an incomplete word. Please type the full industry name (e.g., 'electric vehicles')"
 
     return False, ""
 
@@ -233,71 +233,6 @@ def retrieve_at_least_five_docs(primary_query: str, industry_fallback: str) -> l
         add_docs(docs)
 
     return candidates
-
-# ---------- NEW: brief explanation per URL (used in dropdown + selection UI) ----------
-def llm_explain_pages(topic: str, ranked_list: list) -> list:
-    """
-    Input: ranked_list = [{title,url,score,...}, ...] length <=5
-    Output: list of brief explanations aligned by index
-    """
-    pages = []
-    for r in ranked_list[:TOP_K]:
-        pages.append({
-            "title": r.get("title", ""),
-            "url": r.get("url", ""),
-            "score": int(r.get("score", 0)),
-        })
-
-    prompt = f"""
-You are helping a user choose Wikipedia pages for a market research report.
-
-User topic:
-{topic}
-
-Pages (JSON):
-{json.dumps(pages, ensure_ascii=False)}
-
-Task:
-For each page, write ONE short explanation (max 18 words):
-- what the page is about (topic/category)
-- why it may help (or why it may be weak) for the user topic
-
-Return ONLY valid JSON:
-{{
-  "explanations": [
-    {{"title":"...","url":"...","explain":"..."}},
-    ...
-  ]
-}}
-Rules:
-- Keep explanations short and plain
-- Do not invent facts beyond what title suggests
-""".strip()
-
-    out = []
-    try:
-        raw = llm.invoke(prompt).content.strip()
-        data = safe_json_loads(raw)
-        if data and isinstance(data.get("explanations", None), list):
-            out = data["explanations"]
-    except Exception:
-        out = []
-
-    # Map back to given order (fallback)
-    exp_map = {}
-    for e in out:
-        exp_map[(str(e.get("title","")), str(e.get("url","")))] = str(e.get("explain","")).strip()
-
-    explanations = []
-    for r in ranked_list[:TOP_K]:
-        key = (r.get("title",""), r.get("url",""))
-        explain = exp_map.get(key, "")
-        if not explain:
-            # simple fallback
-            explain = "General reference page; may be broad relative to your market topic"
-        explanations.append(explain)
-
-    return explanations
 
 def llm_rank_docs(industry_query: str, docs):
     items = []
@@ -534,8 +469,82 @@ def relevance_bucket(score: int) -> str:
         return "Related"
     return "Weak match"
 
+# ---------- UPDATED: explanations should match CURRENT keywords (topic + chosen urls) ----------
+def llm_explain_pages_for_choice(topic: str, ranked_all: list, chosen_urls: list) -> list:
+    """
+    Explanations ONLY for pages the user selected (in the order of ranked_all filtered)
+    """
+    url_set = set(chosen_urls or [])
+    selected = [r for r in (ranked_all or []) if (r.get("url") and r.get("url") in url_set)]
+
+    pages = []
+    for r in selected[:TOP_K]:
+        pages.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "score": int(r.get("score", 0)),
+        })
+
+    if not pages:
+        return []
+
+    prompt = f"""
+You are helping a user choose Wikipedia pages for a market research report.
+
+User topic:
+{topic}
+
+Selected pages (JSON):
+{json.dumps(pages, ensure_ascii=False)}
+
+Task:
+For each page, write ONE short explanation (max 18 words):
+- what the page is about (based on title/category)
+- why it fits or is weak for THIS topic
+
+Return ONLY valid JSON:
+{{
+  "explanations": [
+    {{"title":"...","url":"...","explain":"..."}},
+    ...
+  ]
+}}
+Rules:
+- Keep explanations short and plain
+- Be consistent with the topic above
+- Do not invent facts beyond what title suggests
+""".strip()
+
+    out = []
+    try:
+        raw = llm.invoke(prompt).content.strip()
+        data = safe_json_loads(raw)
+        if data and isinstance(data.get("explanations", None), list):
+            out = data["explanations"]
+    except Exception:
+        out = []
+
+    exp_map = {}
+    for e in out:
+        exp_map[(str(e.get("title","")), str(e.get("url","")))] = str(e.get("explain","")).strip()
+
+    explanations = []
+    for r in selected[:TOP_K]:
+        key = (r.get("title",""), r.get("url",""))
+        explain = exp_map.get(key, "")
+        if not explain:
+            explain = "General reference page; may be broad relative to your market topic"
+        explanations.append({
+            "title": r.get("title","Wikipedia page"),
+            "url": r.get("url",""),
+            "score": int(r.get("score", 0)),
+            "explain": explain
+        })
+
+    return explanations
+
 # =========================================================
-# Global error banner (non-blocking)
+# Global error banner
 # =========================================================
 if st.session_state.get("last_error"):
     st.error(st.session_state["last_error"])
@@ -581,7 +590,7 @@ if step1_go:
     bad, reason = is_probably_gibberish_or_incomplete(industry_input)
     if bad:
         st.warning(reason)
-        st.info("Examples you can try: 'electric vehicles', 'pet companionship market', 'cosmetics in Vietnam'")
+        st.info("Examples: 'electric vehicles', 'pet companionship market', 'cosmetics in Vietnam'")
         st.stop()
 
     ok, msg, preview_docs = wiki_sanity_check(industry_input)
@@ -791,13 +800,11 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 st.markdown(f"**Forced topic used:** {st.session_state.get('forced_query','').strip()}")
 
                 ranked_forced = st.session_state.get("ranked", [])[:TOP_K]
-
-                # NEW: if weak overall, be transparent about Wikipedia-only limitation
                 forced_scores = [int(r.get("score", 0)) for r in ranked_forced if r.get("url") or r.get("title")]
                 if forced_scores and max(forced_scores) < RELATED_MIN:
                     st.info(
                         "These results are weak matches. This is the best I can retrieve because this app searches Wikipedia only. "
-                        "Please pick the pages that feel closest to your intent, or try different forced keywords"
+                        "Please pick pages that feel closest to your intent, or try different forced keywords"
                     )
 
                 url_options = []
@@ -848,26 +855,7 @@ if st.session_state.get("step", 1) >= 3:
     )
     st.markdown(f"**Report topic:** {topic_for_report}")
 
-    # NEW: explain each URL topic briefly (dropdown)
-    with st.expander("See brief explanation for each page (to help you choose)"):
-        try:
-            explanations = llm_explain_pages(topic_for_report, ranked_all)
-        except Exception:
-            explanations = [""] * len(ranked_all)
-
-        for i, r in enumerate(ranked_all, 1):
-            title = r.get("title", "Wikipedia page")
-            url = r.get("url", "")
-            score = int(r.get("score", 0))
-            explain = explanations[i-1] if i-1 < len(explanations) else ""
-            st.markdown(f"**{i}. {title}**")
-            st.caption(f"Relevance: {score}/100 • {relevance_bucket(score)}")
-            if explain:
-                st.markdown(f"- {explain}")
-            st.markdown(f"{url or '(no url available)'}")
-            st.divider()
-
-    # Selection UI
+    # Selection UI first (UNCHANGED)
     url_options = []
     for i, r in enumerate(ranked_all, 1):
         title = r.get("title", "Wikipedia page")
@@ -894,6 +882,29 @@ if st.session_state.get("step", 1) >= 3:
         st.warning("Please select at least 1 page (with a valid URL) to generate the report")
         st.stop()
 
+    # ✅ CHANGE YOU ASKED: explanation dropdown comes AFTER selection and must match CURRENT keywords/topic
+    with st.expander("Brief explanation of the pages you selected (to help you double-check)"):
+        try:
+            expl = llm_explain_pages_for_choice(topic_for_report, ranked_all, chosen_urls_step3)
+        except Exception:
+            expl = []
+
+        if not expl:
+            st.info("No explanations available. Try selecting pages that have valid URLs")
+        else:
+            for i, e in enumerate(expl, 1):
+                title = e.get("title", "Wikipedia page")
+                url = e.get("url", "")
+                score = int(e.get("score", 0))
+                explain = e.get("explain", "")
+                st.markdown(f"**{i}. {title}**")
+                st.caption(f"Relevance: {score}/100 • {relevance_bucket(score)}")
+                if explain:
+                    st.markdown(f"- {explain}")
+                st.markdown(f"{url}")
+                st.divider()
+
+    # docs to use
     url_set = set(chosen_urls_step3)
     docs_to_use = []
     for r in ranked_all:
