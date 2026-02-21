@@ -767,7 +767,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
 
         if st.session_state.get("show_keyword_picker"):
             st.divider()
-            st.subheader("Forced keywords (Round 2)")
+            st.subheader("Help me confirm your topic again")
             st.caption("Click suggestions, type your own, or do both")
 
             suggestions2 = st.session_state.get("suggested_keywords", [])
@@ -786,7 +786,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 key="force_typed",
             )
 
-            force_go = st.button("Run forced search", type="primary", use_container_width=True)
+            force_go = st.button("Search", type="primary", use_container_width=True)
 
             if force_go:
                 st.session_state["keyword_pick"] = pick2
