@@ -145,16 +145,15 @@ def is_short_but_allowed(text: str) -> bool:
     return False
 
 # =========================================================
-# ✅ CHANGE #1 (Step 1 classifier): only BLOCK truly random input
-# - If it's vague/incomplete but not random -> allow it and go Step 2
+# ✅ CHANGE (Step 1 classifier): ask user to complete incomplete single words
 # - Return (bad, reason_code, message)
+# reason_code: "random" | "incomplete" | "ok"
 # =========================================================
 def is_probably_gibberish_or_incomplete(text: str):
     """
-    Step 1 should ONLY block truly random / meaningless input.
-    Everything else should pass to Step 2 (even if vague).
+    Step 1 should block truly random / meaningless input.
+    Also, if input looks like an incomplete single word, ask the user to complete it (don’t assume).
     Returns: (bad, reason_code, message)
-    reason_code: "random" | "ok"
     """
     t = (text or "").strip()
     low = t.lower()
@@ -165,8 +164,14 @@ def is_probably_gibberish_or_incomplete(text: str):
     if re.fullmatch(r"[\W_]+", t):
         return True, "random", "That looks like symbols only. Please type a real word or phrase"
 
+    # Allow short acronyms / known abbreviations
     if len(low) <= 3 and is_short_but_allowed(t):
         return False, "ok", ""
+
+    # ✅ If it's a single short alphabetic token and NOT in allowlist, treat as incomplete
+    # (prevents assuming the intended word)
+    if " " not in t and re.fullmatch(r"[A-Za-z]+", t) and 2 <= len(t) <= 4 and not is_short_but_allowed(t):
+        return True, "incomplete", "This looks like an incomplete word. Please type the full word or add 1–2 context words"
 
     letters = re.findall(r"[a-z]", low)
     if len(letters) >= 6:
@@ -174,7 +179,6 @@ def is_probably_gibberish_or_incomplete(text: str):
         if vowels / max(1, len(letters)) < 0.18:
             return True, "random", "This looks like random letters. Please type a real industry/topic"
 
-    # IMPORTANT: do NOT block "incomplete/vague" here anymore
     return False, "ok", ""
 
 def word_count(text: str) -> int:
@@ -603,10 +607,10 @@ if clear_all:
     st.rerun()
 
 # =========================================================
-# ✅ CHANGE #2 (Step 1 flow):
-# - STOP only for random/meaningless input
+# Step 1 flow:
+# - STOP for random input
+# - STOP for incomplete short single word (ask user to complete it)
 # - If Wikipedia sanity check is unclear -> still go Step 2 and ask for context
-# - Remove the extra "Examples" box (single warning only)
 # =========================================================
 if step1_go:
     if not looks_like_input(industry_input):
@@ -614,8 +618,7 @@ if step1_go:
         st.stop()
 
     bad, reason_code, message = is_probably_gibberish_or_incomplete(industry_input)
-    if bad and reason_code == "random":
-        # ✅ Only show try-again behavior for random input
+    if bad and reason_code in ("random", "incomplete"):
         st.warning(message)
         st.stop()
 
@@ -632,11 +635,10 @@ if step1_go:
     st.session_state["last_error"] = ""
 
     if not ok:
-        # ✅ Vague / incomplete / unclear -> Step 2 should ask for more context
         st.session_state["confidence"] = "low"
         st.session_state["need_questions"] = "\n".join([
             "- I’m not sure what you mean yet. Add 1–2 clarifying words (country/segment/use case)",
-            f"- Note: {msg}"
+            f"- {msg}",
         ])
         st.session_state["suggested_keywords"] = ["UK", "Thailand", "B2C", "B2B", "Retail", "E-commerce", "Premium", "Mass market"]
         st.session_state["keyword_pick"] = []
@@ -683,7 +685,6 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
             if st.session_state["confidence"] == "low":
                 qs, kws = generate_clarifying_questions(st.session_state["final_query"], ranked)
 
-                # If Step 1 already injected a helpful note, keep it and append LLM questions
                 if st.session_state.get("need_questions"):
                     prefix = st.session_state["need_questions"].strip()
                     more = "\n".join([f"- {q}" for q in qs])
@@ -691,9 +692,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 else:
                     st.session_state["need_questions"] = "\n".join([f"- {q}" for q in qs])
 
-                # If Step 1 already provided chips, keep them unless LLM provides better ones
                 if st.session_state.get("suggested_keywords"):
-                    # keep existing (from Step 1) and add new unique chips
                     existing = st.session_state["suggested_keywords"]
                     merged = existing + [k for k in kws if k not in existing]
                     st.session_state["suggested_keywords"] = merged[:10]
@@ -727,6 +726,7 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
         if st.session_state.get("need_questions"):
             st.markdown("**Quick questions (so I don’t pull the wrong pages):**")
             st.markdown(st.session_state["need_questions"])
+            st.divider()
 
         st.markdown("**Optional: click a suggestion or type your own clarification**")
         suggestions = st.session_state.get("suggested_keywords", [])
