@@ -114,7 +114,7 @@ def stepper():
     st.divider()
 
 def looks_like_input(text: str) -> bool:
-    # ✅ FIX: accept meaningful 2–3 char inputs (AI, EV, UK, SEO, CRM, etc.)
+    # ✅ accept meaningful 2–3 char inputs (AI, EV, UK, SEO, CRM, etc.)
     t = (text or "").strip()
     if len(t) < 2:
         return False
@@ -123,10 +123,7 @@ def looks_like_input(text: str) -> bool:
     return True
 
 # -----------------------------
-# ✅ FIX: stop over-blocking short meaningful words
-# - remove hard ">=4 chars" rule
-# - allow acronyms (2–4 uppercase letters), common short tokens, and common country codes
-# - use Wikipedia sanity check as the real gate for short inputs
+# Short-token allowlist (keep same)
 # -----------------------------
 COMMON_SHORT_OK = {
     "ai", "ml", "nlp", "ev", "vr", "ar", "ux", "ui", "seo", "sem", "crm", "erp", "saas",
@@ -141,46 +138,44 @@ def is_short_but_allowed(text: str) -> bool:
     low = t.lower()
     if low in COMMON_SHORT_OK:
         return True
-    # Acronyms: 2–5 letters, mostly uppercase (e.g., GDP, ESG, FMCG)
     if re.fullmatch(r"[A-Z]{2,5}", t):
         return True
-    # Alpha+digit short tokens (e.g., 3G, 4G, 5G)
     if re.fullmatch(r"[A-Za-z]{1,3}\d{1,2}", t):
         return True
     return False
 
+# =========================================================
+# ✅ CHANGE #1 (Step 1 classifier): only BLOCK truly random input
+# - If it's vague/incomplete but not random -> allow it and go Step 2
+# - Return (bad, reason_code, message)
+# =========================================================
 def is_probably_gibberish_or_incomplete(text: str):
     """
-    ✅ FIX: Only block truly suspicious input.
-    Short meaningful terms are allowed; Wikipedia sanity check will validate relevance.
+    Step 1 should ONLY block truly random / meaningless input.
+    Everything else should pass to Step 2 (even if vague).
+    Returns: (bad, reason_code, message)
+    reason_code: "random" | "ok"
     """
     t = (text or "").strip()
     low = t.lower()
 
     if len(low) < 2:
-        return True, "Too short. Please type a real industry/topic (at least 2 characters)"
+        return True, "random", "Please enter at least 2 characters"
 
-    # If it's short (<=3) but allowed acronym/token, don't flag as gibberish
+    if re.fullmatch(r"[\W_]+", t):
+        return True, "random", "That looks like symbols only. Please type a real word or phrase"
+
     if len(low) <= 3 and is_short_but_allowed(t):
-        return False, ""
+        return False, "ok", ""
 
-    # If it's very short (2–3) and NOT allowed, don't hard-block; just warn via sanity check later
-    # (so user can still try "tea", "pet", etc.)
-    # We only hard-block if it looks like random characters.
     letters = re.findall(r"[a-z]", low)
-    if len(letters) >= 5:
+    if len(letters) >= 6:
         vowels = sum(ch in "aeiou" for ch in letters)
-        if vowels / max(1, len(letters)) < 0.2:
-            return True, "Looks like random letters. Please type a real word or phrase (e.g., 'electric vehicles')"
+        if vowels / max(1, len(letters)) < 0.18:
+            return True, "random", "This looks like random letters. Please type a real industry/topic"
 
-    # Incomplete single-word heuristic:
-    # Only apply when length >= 5 (so 'pet', 'tea', 'oil' are not punished)
-    if " " not in low and len(low) >= 5:
-        # likely truncated stems
-        if low.endswith(("r", "t", "c", "m", "v", "n", "l")) and not low.endswith(("ing", "ion", "ics", "tech")):
-            return True, "Looks like an incomplete word. Please type the full industry name (e.g., 'electric vehicles')"
-
-    return False, ""
+    # IMPORTANT: do NOT block "incomplete/vague" here anymore
+    return False, "ok", ""
 
 def word_count(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text or ""))
@@ -207,9 +202,8 @@ def retrieve_wikipedia_docs(query: str, top_k: int = 12):
 
 def wiki_sanity_check(industry_text: str):
     """
-    ✅ FIX: treat short inputs fairly:
-    - If user input is short but Wikipedia returns pages, accept it
-    - If Wikipedia returns nothing, ask user to clarify instead of calling it random
+    Keep existing logic (unchanged).
+    Step 1 will no longer STOP on this failure; it will move to Step 2 and ask for context.
     """
     q = _normalize_query(industry_text)
     try:
@@ -226,9 +220,7 @@ def wiki_sanity_check(industry_text: str):
 
     low = q.lower()
 
-    # Only apply partial-word check for short single-words that are NOT known acronyms/tokens
     if " " not in low and len(low) <= 6 and not is_short_but_allowed(q):
-        # If none of the titles contain the token, it might be a typo or partial
         if not any(low in t for t in titles):
             return False, "This might be a typo or partial word. Please re-type or add context (e.g., 'EV market', 'pet care')", docs
 
@@ -610,41 +602,56 @@ if clear_all:
     st.session_state["llm_option"] = keep_llm
     st.rerun()
 
+# =========================================================
+# ✅ CHANGE #2 (Step 1 flow):
+# - STOP only for random/meaningless input
+# - If Wikipedia sanity check is unclear -> still go Step 2 and ask for context
+# - Remove the extra "Examples" box (single warning only)
+# =========================================================
 if step1_go:
     if not looks_like_input(industry_input):
         st.warning("Please enter an industry/topic first")
         st.stop()
 
-    bad, reason = is_probably_gibberish_or_incomplete(industry_input)
-    if bad:
-        st.warning(reason)
-        st.info("Examples: 'EV', 'AI', 'pet companionship market', 'cosmetics in Vietnam'")
+    bad, reason_code, message = is_probably_gibberish_or_incomplete(industry_input)
+    if bad and reason_code == "random":
+        # ✅ Only show try-again behavior for random input
+        st.warning(message)
         st.stop()
 
     ok, msg, preview_docs = wiki_sanity_check(industry_input)
-    if not ok:
-        st.warning(msg)
-        if preview_docs:
-            st.markdown("I found these Wikipedia pages, but they don't clearly match what you typed. Try re-typing your topic")
-            for d in preview_docs[:5]:
-                st.markdown(f"- {extract_title(d)}")
-        st.stop()
 
+    # Always store the input and proceed to Step 2
     st.session_state["industry"] = industry_input.strip()
     st.session_state["clarification"] = ""
     st.session_state["final_query"] = build_query(st.session_state["industry"], "")
     st.session_state["docs"] = []
     st.session_state["ranked"] = []
-    st.session_state["confidence"] = "unknown"
-    st.session_state["need_questions"] = ""
-    st.session_state["suggested_keywords"] = []
-    st.session_state["keyword_pick"] = []
-    st.session_state["keyword_typed"] = ""
-    st.session_state["forced_query"] = ""
-    st.session_state["show_keyword_picker"] = False
     st.session_state["selected_urls"] = []
     st.session_state["report"] = ""
     st.session_state["last_error"] = ""
+
+    if not ok:
+        # ✅ Vague / incomplete / unclear -> Step 2 should ask for more context
+        st.session_state["confidence"] = "low"
+        st.session_state["need_questions"] = "\n".join([
+            "- I’m not sure what you mean yet. Add 1–2 clarifying words (country/segment/use case)",
+            f"- Note: {msg}"
+        ])
+        st.session_state["suggested_keywords"] = ["UK", "Thailand", "B2C", "B2B", "Retail", "E-commerce", "Premium", "Mass market"]
+        st.session_state["keyword_pick"] = []
+        st.session_state["keyword_typed"] = ""
+        st.session_state["forced_query"] = ""
+        st.session_state["show_keyword_picker"] = False
+    else:
+        st.session_state["confidence"] = "unknown"
+        st.session_state["need_questions"] = ""
+        st.session_state["suggested_keywords"] = []
+        st.session_state["keyword_pick"] = []
+        st.session_state["keyword_typed"] = ""
+        st.session_state["forced_query"] = ""
+        st.session_state["show_keyword_picker"] = False
+
     st.session_state["step"] = 2
     st.rerun()
 
@@ -675,8 +682,23 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
 
             if st.session_state["confidence"] == "low":
                 qs, kws = generate_clarifying_questions(st.session_state["final_query"], ranked)
-                st.session_state["need_questions"] = "\n".join([f"- {q}" for q in qs])
-                st.session_state["suggested_keywords"] = kws
+
+                # If Step 1 already injected a helpful note, keep it and append LLM questions
+                if st.session_state.get("need_questions"):
+                    prefix = st.session_state["need_questions"].strip()
+                    more = "\n".join([f"- {q}" for q in qs])
+                    st.session_state["need_questions"] = (prefix + "\n" + more).strip()
+                else:
+                    st.session_state["need_questions"] = "\n".join([f"- {q}" for q in qs])
+
+                # If Step 1 already provided chips, keep them unless LLM provides better ones
+                if st.session_state.get("suggested_keywords"):
+                    # keep existing (from Step 1) and add new unique chips
+                    existing = st.session_state["suggested_keywords"]
+                    merged = existing + [k for k in kws if k not in existing]
+                    st.session_state["suggested_keywords"] = merged[:10]
+                else:
+                    st.session_state["suggested_keywords"] = kws
 
         except Exception as e:
             st.session_state["last_error"] = "Step 2 failed while searching/ranking. Please retry"
