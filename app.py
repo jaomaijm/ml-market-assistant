@@ -692,12 +692,34 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                 else:
                     st.session_state["need_questions"] = "\n".join([f"- {q}" for q in qs])
 
-                if st.session_state.get("suggested_keywords"):
-                    existing = st.session_state["suggested_keywords"]
-                    merged = existing + [k for k in kws if k not in existing]
-                    st.session_state["suggested_keywords"] = merged[:10]
-                else:
-                    st.session_state["suggested_keywords"] = kws
+                # ✅ CHANGE: always ensure keyword chips exist, and seed them from the quick questions
+                base_chips = ["UK", "US", "EU", "APAC", "Thailand", "B2C", "B2B", "Retail", "E-commerce", "Premium", "Mass market"]
+                extracted = []
+                for q in qs:
+                    extracted += re.findall(r"\b[A-Z]{2,5}\b", q)
+                    extracted += re.findall(r"\b[Bb]2[BbCc]\b", q)
+
+                seen = set()
+                seeded_from_qs = []
+                for x in extracted:
+                    x_clean = x.strip()
+                    if x_clean and x_clean not in seen:
+                        seen.add(x_clean)
+                        seeded_from_qs.append(x_clean)
+
+                combined = base_chips + seeded_from_qs + (kws or [])
+
+                # de-dupe while preserving order
+                seen2 = set()
+                final_kws = []
+                for k in combined:
+                    k = str(k).strip()
+                    if not k or k in seen2:
+                        continue
+                    seen2.add(k)
+                    final_kws.append(k)
+
+                st.session_state["suggested_keywords"] = final_kws[:14]
 
         except Exception as e:
             st.session_state["last_error"] = "Step 2 failed while searching/ranking. Please retry"
@@ -774,7 +796,33 @@ if st.session_state.get("step", 1) >= 2 and st.session_state.get("industry", "")
                     st.session_state["show_keyword_picker"] = True
                     qs, kws = generate_clarifying_questions(st.session_state["final_query"], ranked2)
                     st.session_state["need_questions"] = "\n".join([f"- {q}" for q in qs])
-                    st.session_state["suggested_keywords"] = kws
+
+                    # ✅ same seeding behavior here too
+                    base_chips = ["UK", "US", "EU", "APAC", "Thailand", "B2C", "B2B", "Retail", "E-commerce", "Premium", "Mass market"]
+                    extracted = []
+                    for q in qs:
+                        extracted += re.findall(r"\b[A-Z]{2,5}\b", q)
+                        extracted += re.findall(r"\b[Bb]2[BbCc]\b", q)
+
+                    seen = set()
+                    seeded_from_qs = []
+                    for x in extracted:
+                        x_clean = x.strip()
+                        if x_clean and x_clean not in seen:
+                            seen.add(x_clean)
+                            seeded_from_qs.append(x_clean)
+
+                    combined = base_chips + seeded_from_qs + (kws or [])
+                    seen2 = set()
+                    final_kws = []
+                    for k in combined:
+                        k = str(k).strip()
+                        if not k or k in seen2:
+                            continue
+                        seen2.add(k)
+                        final_kws.append(k)
+
+                    st.session_state["suggested_keywords"] = final_kws[:14]
 
                 st.rerun()
 
